@@ -265,6 +265,7 @@ class Engine:
                         streaming_sample_rate = 16000
                 except Exception:
                     streaming_sample_rate = 16000
+            norm_cfg = getattr(config.streaming, 'normalizer', None) or {}
             streaming_config = {
                 'sample_rate': streaming_sample_rate,
                 'jitter_buffer_ms': config.streaming.jitter_buffer_ms,
@@ -287,9 +288,9 @@ class Engine:
                 'continuous_stream': bool(getattr(config.streaming, 'continuous_stream', True)),
                 # Audio normalizer (RMS make-up gain prior to μ-law encode)
                 'normalizer': {
-                    'enabled': bool(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('enabled', True)) if hasattr(config, 'streaming') else True,
-                    'target_rms': int(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('target_rms', 1400)) if hasattr(config, 'streaming') else 1400,
-                    'max_gain_db': float(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('max_gain_db', 9.0)) if hasattr(config, 'streaming') else 9.0,
+                    'enabled': bool(getattr(norm_cfg, 'enabled', True)),
+                    'target_rms': int(getattr(norm_cfg, 'target_rms', 1400)),
+                    'max_gain_db': float(getattr(norm_cfg, 'max_gain_db', 9.0)),
                 },
                 # Diagnostics (optional): enable short PCM taps pre/post compand
                 'diag_enable_taps': bool(getattr(config.streaming, 'diag_enable_taps', False)),
@@ -2534,36 +2535,25 @@ class Engine:
             return
         
         try:
-            # Answer the caller (inbound) or skip (outbound already answered)
-            if not is_outbound:
+            # Direct AudioSocket mode: do NOT answer in ARI — let the dialplan's
+            # Answer() establish the full SIP media path.  Answering in ARI and then
+            # using continue_in_dialplan() leaves the inbound RTP path broken (the
+            # caller's audio never reaches app_audiosocket).
+            use_direct_audiosocket = (
+                getattr(self.config, 'audio_transport', '') == 'audiosocket'
+            )
+            if not is_outbound and not use_direct_audiosocket:
                 logger.info("🎯 HYBRID ARI - Step 1: Answering caller channel", channel_id=caller_channel_id)
                 await self.ari_client.answer_channel(caller_channel_id)
                 logger.info("🎯 HYBRID ARI - Step 1: ✅ Caller channel answered", channel_id=caller_channel_id)
-            else:
+            elif is_outbound:
                 logger.info("🎯 HYBRID ARI - Step 1: Skipping answer (outbound)", channel_id=caller_channel_id)
+            else:
+                logger.info("🎯 HYBRID ARI - Step 1: Skipping ARI answer (direct AudioSocket — dialplan will Answer)",
+                           channel_id=caller_channel_id)
             
-            # Create bridge immediately (use default bridge_type to prevent simple_bridge optimization)
-            logger.info("🎯 HYBRID ARI - Step 2: Creating bridge immediately", channel_id=caller_channel_id)
-            bridge_id = await self.ari_client.create_bridge()  # Uses default: mixing,dtmf_events,proxy_media
-            if not bridge_id:
-                raise RuntimeError("Failed to create mixing bridge")
-            logger.info("🎯 HYBRID ARI - Step 2: ✅ Bridge created", 
-                       channel_id=caller_channel_id, 
-                       bridge_id=bridge_id)
-            
-            # Add caller to bridge
-            logger.info("🎯 HYBRID ARI - Step 3: Adding caller to bridge", 
-                       channel_id=caller_channel_id, 
-                       bridge_id=bridge_id)
-            caller_success = await self.ari_client.add_channel_to_bridge(bridge_id, caller_channel_id)
-            if not caller_success:
-                raise RuntimeError("Failed to add caller channel to bridge")
-            logger.info("🎯 HYBRID ARI - Step 3: ✅ Caller added to bridge", 
-                       channel_id=caller_channel_id, 
-                       bridge_id=bridge_id)
-            self.bridges[caller_channel_id] = bridge_id
-            
-            # Create CallSession and store in SessionStore
+            # Create CallSession (no bridge — direct AudioSocket on SIP channel)
+            bridge_id = None
             session = CallSession(
                 call_id=caller_channel_id,
                 caller_channel_id=caller_channel_id,
@@ -2571,9 +2561,9 @@ class Engine:
                 caller_number=caller_info.get('number'),
                 bridge_id=bridge_id,
                 provider_name=self.config.default_provider,
-                audio_capture_enabled=True,  # FIX #1: Start with capture enabled, only disable when TTS actually starts
+                audio_capture_enabled=True,
                 status="connected",
-                start_time=datetime.now(timezone.utc)  # Track call start time (UTC for consistent storage)
+                start_time=datetime.now(timezone.utc)
             )
             session.is_outbound = bool(is_outbound)
             session.enhanced_vad_enabled = bool(self.vad_manager)
@@ -2948,8 +2938,24 @@ class Engine:
                 else:
                     logger.error("🎯 EXTERNAL MEDIA - Failed to create ExternalMedia channel", channel_id=caller_channel_id)
             else:
-                logger.info("🎯 HYBRID ARI - Step 5: Originating AudioSocket channel", channel_id=caller_channel_id)
-                await self._originate_audiosocket_channel_hybrid(caller_channel_id)
+                # Direct AudioSocket: continue channel to dialplan context that runs
+                # app_audiosocket on the SIP channel itself (no bridge, no second channel).
+                # This avoids the Asterisk bridge audio quality issue.
+                import uuid as _uuid
+                audio_uuid = str(_uuid.uuid4())
+                self.uuidext_to_channel[audio_uuid] = caller_channel_id
+                session.audiosocket_uuid = audio_uuid
+                # Mark session so StasisEnd (from continue) does not trigger cleanup
+                session.continued_to_audiosocket = True
+                await self._save_session(session)
+
+                await self.ari_client.set_channel_var(caller_channel_id, "AUDIOSOCKET_UUID", audio_uuid)
+                logger.info("🎯 DIRECT AUDIOSOCKET - Continuing channel to ai-audiosocket context",
+                           channel_id=caller_channel_id, audio_uuid=audio_uuid)
+                ok = await self.ari_client.continue_in_dialplan(
+                    caller_channel_id, context="ai-audiosocket", extension="s", priority=1)
+                if not ok:
+                    raise RuntimeError("Failed to continue channel to ai-audiosocket context")
             
         except Exception as e:
             logger.error("🎯 HYBRID ARI - Failed to handle caller StasisStart", 
@@ -4066,6 +4072,15 @@ class Engine:
             if channel_id in self._outbound_awaiting_amd_channel_ids:
                 logger.debug("Ignoring StasisEnd during outbound AMD hop", channel_id=channel_id)
                 return
+            # Direct AudioSocket: channel was continued to dialplan, not actually ended.
+            # Cleanup will happen when AudioSocket TCP connection closes.
+            try:
+                sess = await self.session_store.get_by_call_id(channel_id)
+                if sess and getattr(sess, 'continued_to_audiosocket', False):
+                    logger.info("Ignoring StasisEnd for direct AudioSocket channel", channel_id=channel_id)
+                    return
+            except Exception:
+                pass
             await self._cleanup_call(channel_id)
         except Exception as exc:
             logger.error("Error handling StasisEnd", error=str(exc), exc_info=True)
@@ -5136,6 +5151,14 @@ class Engine:
                 uuid=uuid_str,
                 caller_channel_id=caller_channel_id,
             )
+
+            # Direct AudioSocket mode: start provider now (no bridge/Stasis handshake)
+            if session and getattr(session, 'continued_to_audiosocket', False):
+                if not session.provider_session_active:
+                    logger.info("🎯 DIRECT AUDIOSOCKET - Starting provider session",
+                               call_id=caller_channel_id)
+                    await self._ensure_provider_session_started(caller_channel_id)
+
             return True
         except Exception as exc:
             logger.error("Error binding AudioSocket UUID", conn_id=conn_id, uuid=uuid_str, error=str(exc), exc_info=True)
@@ -6700,6 +6723,7 @@ class Engine:
         """Cleanup mappings when an AudioSocket connection disconnects."""
         try:
             caller_channel_id = self.conn_to_channel.pop(conn_id, None)
+            trigger_cleanup = False
             if caller_channel_id:
                 conns = self.channel_to_conns.get(caller_channel_id, set())
                 conns.discard(conn_id)
@@ -6716,9 +6740,15 @@ class Engine:
                     if sess and getattr(sess, 'audiosocket_conn_id', None) == conn_id:
                         sess.audiosocket_conn_id = None
                         await self._save_session(sess)
+                    # Direct AudioSocket: TCP disconnect = call ended
+                    if sess and getattr(sess, 'continued_to_audiosocket', False) and not conns:
+                        trigger_cleanup = True
                 except Exception:
                     pass
             logger.info("AudioSocket connection disconnected", conn_id=conn_id, caller_channel_id=caller_channel_id)
+            if trigger_cleanup and caller_channel_id:
+                logger.info("🎯 DIRECT AUDIOSOCKET - TCP disconnect, cleaning up call", call_id=caller_channel_id)
+                await self._cleanup_call(caller_channel_id)
         except Exception as exc:
             logger.error("Error during AudioSocket disconnect cleanup", conn_id=conn_id, error=str(exc), exc_info=True)
 

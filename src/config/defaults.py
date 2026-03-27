@@ -147,15 +147,31 @@ def apply_diagnostic_defaults(config_data: Dict[str, Any]) -> None:
     # Attack ms (diagnostic only - disabled by default)
     streaming_cfg['attack_ms'] = int(os.getenv('DIAG_ATTACK_MS', '0'))
     
-    # Diagnostic audio taps (disabled by default)
-    env_taps = os.getenv('DIAG_ENABLE_TAPS', 'false')
-    streaming_cfg['diag_enable_taps'] = env_taps.lower() in ('true', '1', 'yes')
-    streaming_cfg['diag_pre_secs'] = int(os.getenv('DIAG_TAP_PRE_SECS', '1'))
-    streaming_cfg['diag_post_secs'] = int(os.getenv('DIAG_TAP_POST_SECS', '1'))
-    streaming_cfg['diag_out_dir'] = os.getenv('DIAG_TAP_OUTPUT_DIR', '/tmp/ai-engine-taps')
-    
-    # Streaming logger verbosity
-    streaming_cfg['logging_level'] = os.getenv('STREAMING_LOG_LEVEL', 'info')
+    # Diagnostic audio taps — env var overrides yaml if set, otherwise keep yaml value
+    env_taps = os.getenv('DIAG_ENABLE_TAPS')
+    if env_taps is not None:
+        streaming_cfg['diag_enable_taps'] = env_taps.lower() in ('true', '1', 'yes')
+    elif 'diag_enable_taps' not in streaming_cfg:
+        streaming_cfg['diag_enable_taps'] = False
+    if 'DIAG_TAP_PRE_SECS' in os.environ:
+        streaming_cfg['diag_pre_secs'] = int(os.environ['DIAG_TAP_PRE_SECS'])
+    elif 'diag_pre_secs' not in streaming_cfg:
+        streaming_cfg['diag_pre_secs'] = 1
+    if 'DIAG_TAP_POST_SECS' in os.environ:
+        streaming_cfg['diag_post_secs'] = int(os.environ['DIAG_TAP_POST_SECS'])
+    elif 'diag_post_secs' not in streaming_cfg:
+        streaming_cfg['diag_post_secs'] = 1
+    if 'DIAG_TAP_OUTPUT_DIR' in os.environ:
+        streaming_cfg['diag_out_dir'] = os.environ['DIAG_TAP_OUTPUT_DIR']
+    elif 'diag_out_dir' not in streaming_cfg:
+        streaming_cfg['diag_out_dir'] = '/tmp/ai-engine-taps'
+
+    # Streaming logger verbosity — env var overrides yaml if set
+    env_log_level = os.getenv('STREAMING_LOG_LEVEL')
+    if env_log_level is not None:
+        streaming_cfg['logging_level'] = env_log_level
+    elif 'logging_level' not in streaming_cfg:
+        streaming_cfg['logging_level'] = 'info'
 
 
 def apply_barge_in_defaults(config_data: Dict[str, Any]) -> None:

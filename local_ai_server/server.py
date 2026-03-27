@@ -1505,7 +1505,13 @@ class LocalAIServer:
                 )
 
             self.tts_model = PiperVoice.load(self.tts_model_path)
-            logging.info("✅ TTS backend: Piper loaded from %s (22kHz native)", self.tts_model_path)
+            # length_scale: < 1.0 = faster, > 1.0 = slower (default None = model default ~1.0)
+            _ls_env = os.getenv("PIPER_LENGTH_SCALE", "")
+            self._piper_length_scale = float(_ls_env) if _ls_env else None
+            logging.info(
+                "✅ TTS backend: Piper loaded from %s (22kHz native, length_scale=%s)",
+                self.tts_model_path, self._piper_length_scale,
+            )
         except Exception as exc:
             logging.error("❌ Failed to load Piper TTS model: %s", exc)
             self.tts_model = None
@@ -2092,7 +2098,9 @@ class LocalAIServer:
                 wav_file.setframerate(22050)
                 try:
                     # Newer Piper API: synthesize(text, wav_file)
-                    self.tts_model.synthesize(text, wav_file)
+                    # length_scale < 1.0 = faster speech (env PIPER_LENGTH_SCALE)
+                    _piper_ls = getattr(self, '_piper_length_scale', None)
+                    self.tts_model.synthesize(text, wav_file, length_scale=_piper_ls)
                 except TypeError:
                     # Fallback: older API returns a generator of frames
                     audio_generator = self.tts_model.synthesize(text)

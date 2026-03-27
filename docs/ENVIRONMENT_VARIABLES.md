@@ -80,6 +80,7 @@ If you’re not sure, start without these; use `agent check` and `docs/Transport
 - `LOCAL_WS_URL`: how `ai_engine` reaches `local_ai_server` (host networking default is `ws://127.0.0.1:8765`).
 - `LOCAL_WS_AUTH_TOKEN`: optional auth token (recommended if you bind `local_ai_server` to non-loopback).
 - `LOCAL_STT_BACKEND`, `LOCAL_TTS_BACKEND`, `LOCAL_AI_MODE`: local runtime/backends (see `.env.example` for the full matrix).
+- `PIPER_LENGTH_SCALE`: Piper TTS speech speed. Values < 1.0 = faster, > 1.0 = slower (default: model default ≈ 1.0). Example: `0.77` for ~30% faster speech.
 
 ### Call History / storage
 

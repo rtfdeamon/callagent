@@ -131,6 +131,26 @@ streaming:
 
 ---
 
+## Piper TTS Speech Speed
+
+Control Piper TTS speech rate via the `PIPER_LENGTH_SCALE` environment variable:
+
+```bash
+# In .env
+PIPER_LENGTH_SCALE=0.77   # ~30% faster speech (good for telephony)
+```
+
+| Value | Effect |
+|-------|--------|
+| `0.65` | ~50% faster (may sound rushed) |
+| `0.77` | ~30% faster (recommended for telephony) |
+| `1.0` | Default speed (model native) |
+| `1.3` | ~30% slower |
+
+No restart of `local_ai_server` container required if `server.py` is bind-mounted; otherwise restart after changing `.env`.
+
+---
+
 ## Pipeline Tuning (v4.0)
 
 v4.0 introduces modular pipelines where STT, LLM, and TTS are separate. Tuning considerations differ from monolithic providers.

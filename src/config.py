@@ -504,7 +504,16 @@ class VADConfig(BaseModel):
     upstream_squelch_end_silence_frames: int = 15
 
 
+class NormalizerConfig(BaseModel):
+    """RMS make-up gain normalizer applied before μ-law encode."""
+    enabled: bool = Field(default=True)
+    target_rms: int = Field(default=1400)
+    max_gain_db: float = Field(default=9.0)
+
+
 class StreamingConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     sample_rate: int = Field(default=8000)
     jitter_buffer_ms: int = Field(default=50)
     keepalive_interval_ms: int = Field(default=5000)
@@ -527,6 +536,15 @@ class StreamingConfig(BaseModel):
     egress_swap_mode: str = Field(default="auto")
     # When true, force outbound streaming audio to μ-law regardless of provider encoding.
     egress_force_mulaw: bool = Field(default=False)
+    # Continuous stream across provider segments (single pacer per call)
+    continuous_stream: bool = Field(default=True)
+    # Audio normalizer (RMS make-up gain prior to μ-law encode)
+    normalizer: NormalizerConfig = Field(default_factory=NormalizerConfig)
+    # Diagnostics: enable short PCM taps pre/post compand
+    diag_enable_taps: bool = Field(default=False)
+    diag_pre_secs: int = Field(default=0)
+    diag_post_secs: int = Field(default=0)
+    diag_out_dir: str = Field(default="/tmp/ai-engine-taps")
 
 
 class LoggingConfig(BaseModel):

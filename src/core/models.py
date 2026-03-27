@@ -103,6 +103,9 @@ class CallSession:
     enhanced_vad_speech_frames: int = 0
     last_provider_audio_ts: float = 0.0
     
+    # Direct AudioSocket mode (no bridge)
+    continued_to_audiosocket: bool = False
+
     # Cleanup and lifecycle
     cleanup_after_tts: bool = False
     cleanup_in_progress: bool = False

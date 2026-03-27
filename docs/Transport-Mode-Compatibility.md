@@ -1,6 +1,6 @@
 # Transport & Playback Mode Compatibility Guide
 
-**Last Updated**: January 7, 2026  
+**Last Updated**: March 27, 2026
 **Issue**: Linear AAVA-28, AAVA-85
 
 ## Overview
@@ -142,6 +142,69 @@ downstream_mode: file  # recommended + most validated for pipelines
 
 ---
 
+### ✅ Configuration 4: Direct AudioSocket (No Bridge) + Pipelines + Streaming
+
+> **New in March 2026.** Replaces the bridge-based AudioSocket architecture for pipeline deployments. Eliminates audio crackling caused by the Asterisk mixing bridge.
+
+**Use Case**: Local pipeline deployments (local STT/LLM/TTS) requiring clean audio without bridge artifacts
+
+**Configuration**:
+```yaml
+audio_transport: audiosocket
+active_pipeline: fast_local  # or any pipeline
+audiosocket:
+  format: slin               # REQUIRED — app_audiosocket hardcodes SLIN (PCM16 8kHz)
+  host: 127.0.0.1
+  port: 8090
+```
+
+**Asterisk Dialplan** (`extensions.conf`):
+```ini
+[ai-audiosocket]
+exten => s,1,Answer()
+ same => n,AudioSocket(${AUDIOSOCKET_UUID},127.0.0.1:8090)
+ same => n,Hangup()
+```
+
+**Technical Details**:
+- **Transport**: Direct `app_audiosocket` on the SIP channel (no bridge, no second channel)
+- **Provider Mode**: Pipeline (modular adapters)
+- **Audio Format**: SLIN (PCM16 signed linear 8kHz, 320 bytes/20ms frame)
+- **Audio Flow**:
+  - ARI Stasis receives call → skips `answer_channel()` → `continue_in_dialplan()` to `[ai-audiosocket]`
+  - Dialplan `Answer()` establishes SIP media path → `AudioSocket()` opens TCP to engine
+  - Caller audio → `app_audiosocket` (`ast_read()`) → TCP TLV → engine → resample 8k→16k → Pipeline STT
+  - TTS audio → engine → TCP TLV → `app_audiosocket` (`ast_write()`) → SIP channel → Caller
+  - **No bridge**: Audio flows directly through `app_audiosocket` on the SIP channel itself
+
+**Status**: ✅ **VALIDATED** (March 2026)
+- Clean audio, no crackling or distortion
+- Bidirectional audio confirmed (STT receives caller speech, TTS heard by caller)
+- Call cleanup triggered by AudioSocket TCP disconnect
+
+**Why This Works**:
+- `app_audiosocket` runs directly on the SIP channel — audio is read/written to the same channel that carries the RTP stream
+- No mixing bridge means no transcoding artifacts or timing issues between channels
+- The dialplan's `Answer()` (not ARI's) establishes the SIP 200 OK, ensuring the inbound RTP media path is fully connected before `app_audiosocket` starts reading frames
+
+**Critical Implementation Notes**:
+1. **Do NOT answer in ARI**: Calling `answer_channel()` in ARI before `continue_in_dialplan()` breaks the inbound RTP path — `app_audiosocket`'s `ast_read()` returns silence frames
+2. **Format must be `slin`**: `res_audiosocket.so` hardcodes `ast_format_slin` (PCM16 signed linear 8kHz). Setting `audiosocket.format: ulaw` will cause garbled audio
+3. **StasisEnd handling**: When `continue_in_dialplan()` moves the channel out of Stasis, ARI fires a `StasisEnd` event — the engine must NOT treat this as a hangup. The `continued_to_audiosocket` session flag prevents premature cleanup
+4. **Cleanup on TCP disconnect**: Since there's no bridge or Stasis to signal call end, the engine triggers `_cleanup_call()` when the AudioSocket TCP connection closes
+
+**Comparison with Bridge-Based AudioSocket (Configuration 2/3)**:
+
+| Aspect | Bridge-Based (old) | Direct (new) |
+|--------|-------------------|--------------|
+| Architecture | ARI bridge + `chan_audiosocket` channel | `app_audiosocket` on SIP channel |
+| Audio quality | Crackling/distortion in bridge | Clean |
+| Channels per call | 2 (SIP + AudioSocket) | 1 (SIP only) |
+| Answer method | ARI `answer_channel()` | Dialplan `Answer()` |
+| Cleanup trigger | ARI StasisEnd / bridge events | AudioSocket TCP disconnect |
+
+---
+
 ## Configuration Matrix
 
 | Transport | Provider Mode | Playback Method | Gating | Status |
@@ -149,6 +212,7 @@ downstream_mode: file  # recommended + most validated for pipelines
 | **ExternalMedia RTP** | Pipeline | File (PlaybackManager) | ✅ Working | ✅ **VALIDATED** |
 | **AudioSocket** | Full Agent | Streaming (StreamingPlaybackManager) | ✅ Working | ✅ **VALIDATED** |
 | **AudioSocket** | Pipeline | File (PlaybackManager) | ✅ Working | ✅ **VALIDATED** (v4.0+) |
+| **AudioSocket (Direct)** | Pipeline | Streaming (no bridge) | ✅ Working | ✅ **VALIDATED** (March 2026) |
 | **ExternalMedia RTP** | Pipeline | Streaming-first (fallback to file) | ✅ Working | ⚠️ **SUPPORTED (v5.1.4+)** |
 | **AudioSocket** | Pipeline | Streaming-first (fallback to file) | ✅ Working | ⚠️ **SUPPORTED (v5.1.4+)** |
 
@@ -230,6 +294,18 @@ providers:
 2. Check gating logs for feedback loop
 3. Verify pipeline audio routing in logs
 4. If issues persist, use `audio_transport: externalmedia` as fallback
+
+### Symptom: Audio crackling/distortion from TTS (bridge-based AudioSocket)
+
+**Cause**: The Asterisk mixing bridge between `chan_audiosocket` and the SIP channel introduces audio artifacts. This is a known issue with bridge-based AudioSocket transport.
+
+**Solution**: Switch to **Direct AudioSocket** (Configuration 4). This runs `app_audiosocket` directly on the SIP channel, bypassing the bridge entirely. See Configuration 4 above for setup.
+
+### Symptom: STT receives silence (Direct AudioSocket)
+
+**Cause**: The channel was answered in ARI (`answer_channel()`) before being continued to dialplan. This leaves the inbound RTP path broken.
+
+**Solution**: Ensure the engine skips ARI answer for direct AudioSocket mode (`audio_transport: audiosocket`). The dialplan context `[ai-audiosocket]` must include `Answer()` before `AudioSocket()`.
 
 ### Symptom: No audio frames after initial connection
 
@@ -348,6 +424,7 @@ See [Milestone 23: NAT/Hybrid Network Support](./contributing/milestones/milesto
 | 2025-11-19 | AudioSocket | Full Agent (Deepgram) | ✅ Pass | Clean conversation |
 | 2025-11-19 | AudioSocket | Full Agent (OpenAI) | ✅ Pass | Tool execution validated |
 | 2025-11-19 | AudioSocket | Pipeline (local_hybrid) | ✅ Pass | Post-fix validation |
+| 2026-03-27 | AudioSocket (Direct) | Pipeline (fast_local) | ✅ Pass | No bridge, no crackling |
 
 ---
 
