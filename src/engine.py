@@ -12,6 +12,7 @@ import uuid
 import audioop
 import base64
 import json
+from src.rag import retrieve as rag_retrieve
 import ipaddress
 import sqlite3
 from collections import deque
@@ -5345,6 +5346,20 @@ class Engine:
                     # Keep simple DC offset removal (audioop.bias) above, skip IIR filter
             except Exception:
                 logger.debug("Inbound DC conditioning failed", call_id=caller_channel_id, exc_info=True)
+            # Inbound AGC: normalize audio level for STT recognition.
+            # app_audiosocket delivers very quiet SLIN — without gain, Vosk
+            # receives near-silence and produces garbage transcripts.
+            try:
+                if pcm_bytes and len(pcm_bytes) >= 160:
+                    _agc_target_rms = 3000
+                    _agc_max_gain = 20.0
+                    _rms = audioop.rms(pcm_bytes, 2)
+                    if _rms > 15:
+                        _gain = min(_agc_target_rms / _rms, _agc_max_gain)
+                        if _gain > 1.1:
+                            pcm_bytes = audioop.mul(pcm_bytes, 2, _gain)
+            except Exception:
+                pass
             try:
                 if pcm_bytes:
                     self._update_audio_diagnostics(session, "transport_in", pcm_bytes, "slin16", pcm_rate)
@@ -8832,6 +8847,22 @@ class Engine:
                 greeting = self._apply_prompt_template_substitution(greeting, session)
             
             if greeting:
+                # Wait for AudioSocket connection in direct AudioSocket mode
+                # (greeting starts before Asterisk finishes continue_in_dialplan)
+                if getattr(session, 'continued_to_audiosocket', False):
+                    for _wait_i in range(50):  # up to 1s
+                        session = await self.session_store.get_by_call_id(call_id)
+                        if not session:
+                            return
+                        if getattr(session, 'audiosocket_conn_id', None):
+                            break
+                        await asyncio.sleep(0.02)
+                    else:
+                        logger.warning(
+                            "Pipeline greeting: AudioSocket connection not ready after 1s",
+                            call_id=call_id,
+                        )
+
                 max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
                     try:
@@ -9157,12 +9188,76 @@ class Engine:
             async def dialog_worker() -> None:
                 pending_segments: List[str] = []
                 flush_task: Optional[asyncio.Task] = None
+                silence_monitor_task: Optional[asyncio.Task] = None
                 accumulation_timeout = float(
                     (pipeline.llm_options or {}).get("aggregation_timeout_sec", 2.0)
                 )
                 # Track conversation history to include prior messages
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
+
+                # Silence timeout: re-prompt after 5s, hangup after 15s
+                _silence_reprompt_sec = float(
+                    self.config.raw.get("silence_timeout", {}).get("reprompt_sec", 5)
+                    if hasattr(self.config, 'raw') else 5
+                )
+                _silence_hangup_sec = float(
+                    self.config.raw.get("silence_timeout", {}).get("hangup_sec", 15)
+                    if hasattr(self.config, 'raw') else 15
+                )
+                _silence_reprompt_text = "Алло, вы меня слышите?"
+                _last_activity_ts = time.time()
+                _silence_warned = False
+
+                async def _speak_silence_prompt(text: str) -> None:
+                    """Synthesize and play a short prompt via pipeline TTS."""
+                    try:
+                        tts_bytes = bytearray()
+                        async for chunk in pipeline.tts_adapter.synthesize(call_id, text, pipeline.tts_options):
+                            if chunk:
+                                tts_bytes.extend(chunk)
+                        if tts_bytes:
+                            await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
+                    except Exception:
+                        logger.debug("Silence prompt TTS failed", call_id=call_id, exc_info=True)
+
+                async def _silence_monitor() -> None:
+                    """Monitor caller silence and act on thresholds."""
+                    nonlocal _last_activity_ts, _silence_warned
+                    while True:
+                        await asyncio.sleep(1.0)
+                        if session.tts_playing:
+                            _last_activity_ts = time.time()
+                            continue
+                        elapsed = time.time() - _last_activity_ts
+                        if elapsed >= _silence_hangup_sec:
+                            logger.info(
+                                "🔇 SILENCE TIMEOUT - Hanging up",
+                                call_id=call_id,
+                                silence_sec=round(elapsed, 1),
+                            )
+                            await _speak_silence_prompt(
+                                "К сожалению, я вас не слышу. Перезвоните, пожалуйста. До свидания."
+                            )
+                            await asyncio.sleep(3)
+                            try:
+                                await self._cleanup_call(call_id, outcome="silence_timeout")
+                            except Exception:
+                                pass
+                            return
+                        if elapsed >= _silence_reprompt_sec and not _silence_warned:
+                            _silence_warned = True
+                            logger.info(
+                                "🔇 SILENCE WARNING - Re-prompting caller",
+                                call_id=call_id,
+                                silence_sec=round(elapsed, 1),
+                            )
+                            await _speak_silence_prompt(_silence_reprompt_text)
+
+                def _reset_silence():
+                    nonlocal _last_activity_ts, _silence_warned
+                    _last_activity_ts = time.time()
+                    _silence_warned = False
 
                 async def cancel_flush() -> None:
                     nonlocal flush_task
@@ -9185,6 +9280,15 @@ class Engine:
                     # Build context with conversation history
                     # System prompt only in first turn (when history is empty)
                     context_for_llm = {"prior_messages": list(conversation_history)}
+
+                    # RAG: inject relevant knowledge base chunks
+                    try:
+                        rag_text = rag_retrieve(transcript_text)
+                        if rag_text:
+                            context_for_llm["rag_context"] = rag_text
+                            logger.debug("RAG context injected", call_id=call_id, length=len(rag_text))
+                    except Exception:
+                        pass
                     
                     try:
                         llm_result = await pipeline.llm_adapter.generate(
@@ -9384,19 +9488,27 @@ class Engine:
                                 playback_id = stream_id
                                 first_tts_ts: Optional[float] = None
 
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
-                                    if not tts_chunk:
-                                        continue
-                                    if first_tts_ts is None:
-                                        first_tts_ts = time.time()
-                                        turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                        session.turn_latencies_ms.append(turn_latency_ms)
-                                        try:
-                                            if t_start is not None:
-                                                _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
-                                        except Exception:
-                                            pass
-                                    await stream_q.put(tts_chunk)
+                                # Split response into sentences and synthesize each
+                                # This reduces time-to-first-audio by ~500ms
+                                sentences = re.split(r'(?<=[.!?])\s+', response_text)
+                                sentences = [s.strip() for s in sentences if s.strip()]
+                                if not sentences:
+                                    sentences = [response_text]
+
+                                for sentence in sentences:
+                                    async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, sentence, pipeline.tts_options):
+                                        if not tts_chunk:
+                                            continue
+                                        if first_tts_ts is None:
+                                            first_tts_ts = time.time()
+                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                            session.turn_latencies_ms.append(turn_latency_ms)
+                                            try:
+                                                if t_start is not None:
+                                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
+                                            except Exception:
+                                                pass
+                                        await stream_q.put(tts_chunk)
 
                                 # End-of-segment sentinel
                                 try:
@@ -9491,6 +9603,9 @@ class Engine:
                                         )
                                 except Exception:
                                     logger.error("Pipeline playback exception", call_id=call_id, exc_info=True)
+
+                    # Reset silence timer after agent speaks
+                    _reset_silence()
 
                     # 2. Execute Tools (if any)
                     if tool_calls:
@@ -9622,6 +9737,11 @@ class Engine:
                                         logger.info("Transfer successful, ending turn loop", tool=name, canonical_tool=canonical_tool)
                                         return
                                     
+                                    # Silent tools (e.g., save_lead_info): skip LLM continuation
+                                    if result.get("silent"):
+                                        logger.debug("Silent tool executed, skipping LLM continuation", tool=name, call_id=call_id)
+                                        continue
+
                                     # Handle non-terminal tools (e.g., request_transcript)
                                     # Feed result back to LLM for continuation
                                     if not result.get("will_hangup") and canonical_tool not in ("blind_transfer", "live_agent_transfer"):
@@ -9760,11 +9880,14 @@ class Engine:
                     threshold_met = words >= 3 or chars >= 12
                     if not threshold_met:
                         if force:
-                            pending_segments.clear()
+                            # Flush timeout: send short text to LLM instead of discarding
+                            # (STT fragments like "не нужно" are still valid user input)
                             if from_flush:
                                 flush_task = None
                             else:
                                 await cancel_flush()
+                            await run_turn(aggregated)
+                            pending_segments.clear()
                         else:
                             logger.debug(
                                 "Accumulating transcript before LLM",
@@ -9794,6 +9917,7 @@ class Engine:
 
                     flush_task = asyncio.create_task(_flush())
 
+                silence_monitor_task = asyncio.create_task(_silence_monitor())
                 try:
                     while True:
                         transcript = await transcript_queue.get()
@@ -9805,6 +9929,7 @@ class Engine:
                             if pending_segments and flush_task is None:
                                 await schedule_flush()
                             continue
+                        _reset_silence()  # caller spoke — reset silence timer
                         pending_segments.append(normalized)
                         await maybe_respond(force=False)
                         if pending_segments:
@@ -9813,6 +9938,12 @@ class Engine:
                     pass
                 finally:
                     await cancel_flush()
+                    if silence_monitor_task and not silence_monitor_task.done():
+                        silence_monitor_task.cancel()
+                        try:
+                            await silence_monitor_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
             ingest_task = asyncio.create_task(ingest_audio())
 
@@ -12207,6 +12338,7 @@ class Engine:
                 summary=getattr(session, 'summary', None),
                 tool_calls=list(getattr(session, 'tool_calls', []) or []),
                 pre_call_results=dict(getattr(session, 'pre_call_results', {}) or {}),
+                lead_data=dict(getattr(session, 'lead_data', {}) or {}),
                 campaign_id=getattr(session, 'outbound_campaign_id', None),
                 lead_id=getattr(session, 'outbound_lead_id', None),
                 config=self.config.dict() if hasattr(self.config, 'dict') else {},

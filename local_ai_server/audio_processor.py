@@ -93,6 +93,7 @@ class AudioProcessor:
                 "-t",
                 "raw",
                 output_path,
+                "gain", "-n",  # normalize to 0dBFS before µ-law encoding
             ]
 
             subprocess.run(cmd, capture_output=True, check=True)

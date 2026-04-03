@@ -165,6 +165,9 @@ class CallSession:
     # Pre-call tool results (Milestone 24) - CRM lookup data injected into prompts
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # {variable_name: value}
 
+    # Lead qualification data (collected by save_lead_info tool during call)
+    lead_data: Dict[str, Any] = field(default_factory=dict)
+
     # Outbound campaign dialer (Milestone 22)
     is_outbound: bool = False
     outbound_campaign_id: Optional[str] = None

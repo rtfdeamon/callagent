@@ -229,9 +229,9 @@ class StreamingPlaybackManager:
         except Exception:
             self.normalizer_target_rms = 1400
         try:
-            self.normalizer_max_gain_db: float = float(norm.get('max_gain_db', 9.0))
+            self.normalizer_max_gain_db: float = float(norm.get('max_gain_db', 30.0))
         except Exception:
-            self.normalizer_max_gain_db = 9.0
+            self.normalizer_max_gain_db = 30.0
         # Derived configuration (chunk counts)
         self.min_start_ms = max(0, int(self.streaming_config.get('min_start_ms', 120)))
         self.low_watermark_ms = max(0, int(self.streaming_config.get('low_watermark_ms', 80)))
@@ -2677,7 +2677,17 @@ class StreamingPlaybackManager:
                         logger.debug("AudioSocket broadcast sent", call_id=call_id, stream_id=stream_id, recipients=len(conns))
                     return True
                 # Normal single-conn send
-                success = await self.audiosocket_server.send_audio(conn_id, chunk)
+                # Amplify outbound SLIN audio — Piper TTS µ-law→PCM16 produces
+                # very quiet SLIN (rms ~24). Boost by 6× to reach audible levels.
+                # Unlike Asterisk VOLUME(TX), this doesn't create a feedback loop.
+                _out_chunk = chunk
+                try:
+                    _fmt = self._canonicalize_encoding(target_fmt) or self._canonicalize_encoding(self.audiosocket_format) or "ulaw"
+                    if _fmt in ("slin", "pcm16", "slin16") and len(chunk) >= 160:
+                        _out_chunk = audioop.mul(chunk, 2, 6.0)
+                except Exception:
+                    _out_chunk = chunk
+                success = await self.audiosocket_server.send_audio(conn_id, _out_chunk)
                 if not success:
                     logger.warning("AudioSocket streaming send failed", call_id=call_id, stream_id=stream_id)
                 else:

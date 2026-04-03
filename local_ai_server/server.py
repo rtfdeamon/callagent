@@ -756,6 +756,133 @@ class LocalAIServer:
         # Process buffer after N ms of silence (idle finalizer).
         self.buffer_timeout_ms = self.config.stt_idle_ms
 
+        # Silero VAD for adaptive endpointing (replaces fixed idle timer)
+        self._vad_session = None
+        self._vad_model = None
+        self._vad_h = None
+        self._vad_c = None
+        self._vad_enabled = False
+        self._vad_min_silence_ms = 200  # finalize after 200ms silence
+        self._vad_threshold = 0.7      # speech probability threshold
+        self._vad_threshold_playing = 0.9  # higher during TTS (echo gate)
+        self._init_silero_vad()
+
+    def _init_silero_vad(self):
+        """Initialize Silero VAD v4 ONNX for adaptive endpointing."""
+        import numpy as np
+        vad_path = os.path.join(os.path.dirname(__file__), "..", "models", "silero_vad.onnx")
+        if not os.path.exists(vad_path):
+            vad_path = "/app/models/silero_vad.onnx"
+        if not os.path.exists(vad_path):
+            logging.warning("Silero VAD not found at %s — using fixed idle timer", vad_path)
+            return
+        try:
+            import onnxruntime
+            self._vad_model = onnxruntime.InferenceSession(
+                vad_path, providers=["CPUExecutionProvider"]
+            )
+            self._vad_h = np.zeros((2, 1, 64), dtype=np.float32)
+            self._vad_c = np.zeros((2, 1, 64), dtype=np.float32)
+            self._vad_enabled = True
+            logging.info("✅ Silero VAD loaded (ONNX, 8kHz, threshold=%.1f, min_silence=%dms)",
+                         self._vad_threshold, self._vad_min_silence_ms)
+        except Exception as exc:
+            logging.warning("Silero VAD init failed: %s — using fixed idle timer", exc)
+
+    def _vad_process_chunk(self, audio_8k_int16: bytes) -> float:
+        """Run VAD on 512-sample (64ms) chunk of 8kHz int16 audio. Returns speech probability."""
+        import numpy as np
+        if not self._vad_enabled or self._vad_model is None:
+            return 0.0
+        samples = np.frombuffer(audio_8k_int16, dtype=np.int16).astype(np.float32) / 32768.0
+        # Pad/truncate to 512 samples
+        if len(samples) < 512:
+            samples = np.pad(samples, (0, 512 - len(samples)))
+        elif len(samples) > 512:
+            samples = samples[:512]
+        sr = np.array(8000, dtype=np.int64)
+        try:
+            out, self._vad_h, self._vad_c = self._vad_model.run(
+                None, {"input": samples[None], "sr": sr, "h": self._vad_h, "c": self._vad_c}
+            )
+            return float(out[0][0])
+        except Exception:
+            return 0.0
+
+    def _vad_feed(self, session, audio_data: bytes, input_rate: int):
+        """Feed audio to Silero VAD and track speech/silence state per session."""
+        import numpy as np
+        if not self._vad_enabled:
+            return
+        # Convert to 8kHz int16 if needed
+        if input_rate == 8000:
+            audio_8k = audio_data
+        elif input_rate == 16000:
+            # Downsample 16kHz→8kHz by taking every other sample
+            arr = np.frombuffer(audio_data, dtype=np.int16)
+            audio_8k = arr[::2].tobytes()
+        else:
+            audio_8k = audio_data
+
+        # Init per-session VAD state
+        if not hasattr(session, '_vad_speech_active'):
+            session._vad_speech_active = False
+            session._vad_silence_start = 0.0
+            session._vad_speech_start = 0.0
+
+        # Process in 512-sample (64ms) chunks
+        chunk_size = 512 * 2  # 512 samples * 2 bytes/sample
+        pos = 0
+        while pos + chunk_size <= len(audio_8k):
+            chunk = audio_8k[pos:pos + chunk_size]
+            prob = self._vad_process_chunk(chunk)
+            now = monotonic()
+
+            if prob >= self._vad_threshold:
+                # Speech detected
+                if not session._vad_speech_active:
+                    session._vad_speech_active = True
+                    session._vad_speech_start = now
+                session._vad_silence_start = 0.0
+            else:
+                # Silence
+                if session._vad_speech_active and session._vad_silence_start == 0.0:
+                    session._vad_silence_start = now
+                # Check if silence exceeded threshold → trigger early finalization
+                if (session._vad_speech_active
+                        and session._vad_silence_start > 0
+                        and (now - session._vad_silence_start) * 1000 >= self._vad_min_silence_ms):
+                    # Reset VAD state
+                    session._vad_speech_active = False
+                    session._vad_silence_start = 0.0
+                    # VAD detected end of speech — trigger immediate STT finalization
+                    logging.info(
+                        "🎤 VAD END-OF-SPEECH detected call_id=%s (200ms silence after speech)",
+                        getattr(session, 'call_id', '?'),
+                    )
+                    # Cancel any pending slow idle timer
+                    if hasattr(session, 'idle_task') and session.idle_task and not session.idle_task.done():
+                        session.idle_task.cancel()
+                        session.idle_task = None
+                    # Immediately finalize STT (no timer delay)
+                    ws = getattr(session, '_vad_websocket', None)
+                    if ws and session.recognizer:
+                        try:
+                            result = json.loads(session.recognizer.FinalResult() or "{}")
+                            text = (result.get("text") or "").strip()
+                            meta = getattr(session, 'last_request_meta', {})
+                            asyncio.create_task(
+                                self._handle_final_transcript(
+                                    ws, session, meta.get('request_id'),
+                                    mode=meta.get('mode', 'stt'),
+                                    text=text, confidence=None, idle_promoted=True,
+                                )
+                            )
+                        except Exception:
+                            pass
+                    return
+            pos += chunk_size
+
     @staticmethod
     def _parse_optional_bool(raw: Optional[str]) -> Optional[bool]:
         if raw is None:
@@ -978,6 +1105,27 @@ class LocalAIServer:
         else:
             logging.info("✅ All models loaded successfully for MVP pipeline")
 
+        # Initialize TTS cache and pre-generate common phrases
+        try:
+            from tts_cache import TTSCache, PRECACHE_PHRASES
+            self._tts_cache = TTSCache()
+            self._tts_cache.load_from_disk()
+            if self._tts_cache.size() < len(PRECACHE_PHRASES):
+                logging.info("📦 Pre-caching %d common TTS phrases...", len(PRECACHE_PHRASES))
+                for phrase in PRECACHE_PHRASES:
+                    if not self._tts_cache.get(phrase):
+                        try:
+                            audio = await self._process_tts_uncached(phrase)
+                            if audio:
+                                self._tts_cache.put(phrase, audio)
+                        except Exception:
+                            pass
+                self._tts_cache.save_to_disk()
+                logging.info("📦 TTS cache ready: %d phrases", self._tts_cache.size())
+        except Exception as exc:
+            logging.warning("TTS cache init failed: %s", exc)
+            self._tts_cache = None
+
     async def _load_stt_model(self):
         """Load STT model based on configured backend (vosk, kroko, sherpa, faster_whisper, or whisper_cpp)."""
         if self.stt_backend == "kroko":
@@ -986,6 +1134,12 @@ class LocalAIServer:
             await self._load_sherpa_backend()
         elif self.stt_backend == "faster_whisper":
             await self._load_faster_whisper_backend()
+            # Hybrid: also load Vosk for VAD/pause detection
+            try:
+                await self._load_vosk_backend()
+                logging.info("🎤 HYBRID STT: Vosk (VAD) + Whisper (transcription)")
+            except Exception as exc:
+                logging.warning("Vosk VAD not available for hybrid mode: %s", exc)
         elif self.stt_backend == "whisper_cpp":
             await self._load_whisper_cpp_backend()
         else:
@@ -1475,8 +1629,10 @@ class LocalAIServer:
             )
 
     async def _load_tts_model(self):
-        """Load TTS model based on configured backend (piper, kokoro, or melotts)."""
-        if self.tts_backend == "kokoro":
+        """Load TTS model based on configured backend (piper, kokoro, silero, or melotts)."""
+        if self.tts_backend == "silero":
+            await self._load_silero_backend()
+        elif self.tts_backend == "kokoro":
             await self._load_kokoro_backend()
         elif self.tts_backend == "melotts":
             await self._load_melotts_backend()
@@ -1515,6 +1671,47 @@ class LocalAIServer:
         except Exception as exc:
             logging.error("❌ Failed to load Piper TTS model: %s", exc)
             self.tts_model = None
+            self.startup_errors["tts"] = str(exc)
+            if self.fail_fast:
+                raise
+
+    async def _load_silero_backend(self):
+        """Load Silero TTS v5 model (CPU, 48kHz generation → 8kHz µ-law)."""
+        try:
+            import torch
+            # Use cached model if available (pre-downloaded during Docker build)
+            torch_home = os.environ.get("TORCH_HOME", "")
+            local_repo = os.path.join(torch_home, "hub", "snakers4_silero-models_master")
+            silero_version = os.getenv("SILERO_MODEL_VERSION", "v5_4_ru")
+            load_kwargs = dict(model='silero_tts', language='ru', speaker=silero_version)
+            if os.path.isdir(local_repo):
+                self._silero_model, _ = torch.hub.load(
+                    repo_or_dir=local_repo, source='local', **load_kwargs,
+                )
+            else:
+                self._silero_model, _ = torch.hub.load(
+                    repo_or_dir='snakers4/silero-models', **load_kwargs,
+                )
+            self._silero_speaker = os.getenv("SILERO_SPEAKER", "xenia")
+            # Generate at 48kHz for richer sound, resample to 8kHz for telephony
+            self._silero_gen_rate = int(os.getenv("SILERO_SAMPLE_RATE", "48000"))
+            self._silero_put_accent = os.getenv("SILERO_PUT_ACCENT", "true").lower() == "true"
+            self._silero_put_yo = os.getenv("SILERO_PUT_YO", "true").lower() == "true"
+            # Verify speaker exists
+            test_audio = self._silero_model.apply_tts(
+                text="тест", speaker=self._silero_speaker,
+                sample_rate=self._silero_gen_rate,
+                put_accent=self._silero_put_accent, put_yo=self._silero_put_yo,
+            )
+            _src = "local" if os.path.isdir(local_repo) else "github"
+            logging.info(
+                "✅ TTS backend: Silero %s loaded (speaker=%s, gen_rate=%dHz, accent=%s, yo=%s, CPU, source=%s)",
+                silero_version, self._silero_speaker, self._silero_gen_rate,
+                self._silero_put_accent, self._silero_put_yo, _src,
+            )
+        except Exception as exc:
+            logging.error("❌ Failed to load Silero TTS: %s", exc, exc_info=True)
+            self._silero_model = None
             self.startup_errors["tts"] = str(exc)
             if self.fail_fast:
                 raise
@@ -2028,7 +2225,26 @@ class LocalAIServer:
 
     async def process_tts(self, text: str) -> bytes:
         """Process TTS with 8kHz uLaw generation - routes to appropriate backend."""
-        if self.tts_backend == "kokoro":
+        # Check TTS cache first (instant playback for common phrases)
+        if hasattr(self, '_tts_cache') and self._tts_cache:
+            cached = self._tts_cache.get(text)
+            if cached:
+                logging.info("⚡ TTS CACHE HIT: '%s' (%d bytes)", text[:40], len(cached))
+                return cached
+
+        result = await self._process_tts_uncached(text)
+
+        # Store in cache for future use
+        if hasattr(self, '_tts_cache') and self._tts_cache and result and len(text) < 100:
+            self._tts_cache.put(text, result)
+
+        return result
+
+    async def _process_tts_uncached(self, text: str) -> bytes:
+        """Actual TTS synthesis (no cache)."""
+        if self.tts_backend == "silero":
+            return await self._process_tts_silero(text)
+        elif self.tts_backend == "kokoro":
             return await self._process_tts_kokoro(text)
         elif self.tts_backend == "melotts":
             return await self._process_tts_melotts(text)
@@ -2075,6 +2291,84 @@ class LocalAIServer:
 
         except Exception as exc:
             logging.error("MeloTTS processing failed: %s", exc, exc_info=True)
+            return b""
+
+    async def _process_tts_silero(self, text: str) -> bytes:
+        """Process TTS using Silero v5 backend (48kHz generation → 8kHz µ-law).
+
+        Pipeline: text → Silero@48kHz → sox(rate -v, norm, compand) → 8kHz µ-law
+        The compand step compresses dynamics for clear telephony playback.
+        """
+        try:
+            if not getattr(self, '_silero_model', None):
+                logging.error("Silero TTS model not loaded")
+                return b""
+
+            gen_rate = self._silero_gen_rate
+
+            # Check if text has SSML tags
+            is_ssml = text.strip().startswith("<speak")
+
+            def _synthesize():
+                import numpy as np
+                tts_kwargs = dict(
+                    speaker=self._silero_speaker,
+                    sample_rate=gen_rate,
+                    put_accent=self._silero_put_accent,
+                    put_yo=self._silero_put_yo,
+                )
+                if is_ssml:
+                    audio = self._silero_model.apply_tts(ssml_text=text, **tts_kwargs)
+                else:
+                    audio = self._silero_model.apply_tts(text=text, **tts_kwargs)
+
+                pcm_float = audio.numpy()
+                pcm_int16 = (pcm_float * 32767).clip(-32768, 32767).astype(np.int16)
+                pcm_bytes = pcm_int16.tobytes()
+
+                if gen_rate == 8000:
+                    import audioop
+                    return audioop.lin2ulaw(pcm_bytes, 2)
+
+                # High-quality resample + telephony dynamics via sox
+                wav_path = tempfile.mktemp(suffix=".wav")
+                ulaw_path = tempfile.mktemp(suffix=".raw")
+                try:
+                    with wave.open(wav_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(gen_rate)
+                        wf.writeframes(pcm_bytes)
+                    subprocess.run([
+                        "sox", wav_path,
+                        "-r", "8000", "-c", "1", "-e", "mu-law", "-b", "8",
+                        "-t", "raw", ulaw_path,
+                        "tempo", "1.1",          # 10% faster speech
+                        "rate", "-v",            # very high quality resampling
+                        "sinc", "300-3400",      # bandpass: telephony G.711 band
+                        "norm", "-3",            # normalize to -3dB (headroom)
+                        "compand",               # soft telephony compressor (no clipping)
+                        "0.02,0.5",              # attack 20ms, decay 500ms
+                        "-60,-60,-30,-20,-20,-15,-6,-6,-3,-3",
+                        "0", "-76", "0.02",
+                    ], capture_output=True, check=True)
+                    with open(ulaw_path, "rb") as f:
+                        return f.read()
+                finally:
+                    for p in (wav_path, ulaw_path):
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+            ulaw_data = await asyncio.to_thread(_synthesize)
+            logging.info(
+                "🔊 TTS RESULT - Silero generated uLaw 8kHz audio: %s bytes (gen@%dHz)",
+                len(ulaw_data), gen_rate,
+            )
+            return ulaw_data
+        except Exception as exc:
+            logging.error("Silero TTS processing failed: %s", exc, exc_info=True)
             return b""
 
     async def _process_tts_piper(self, text: str) -> bytes:
@@ -2320,7 +2614,46 @@ class LocalAIServer:
         elif self.stt_backend == "whisper_cpp":
             return await self._process_stt_stream_whisper_cpp(session, audio_data, input_rate)
         else:
+            # Vosk streaming — feed VAD in parallel for adaptive endpointing
+            if self._vad_enabled:
+                self._vad_feed(session, audio_data, input_rate)
             return await self._process_stt_stream_vosk(session, audio_data, input_rate)
+
+    async def _process_stt_hybrid_vosk_whisper(
+        self,
+        session: SessionContext,
+        audio_data: bytes,
+        input_rate: int,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid STT: Vosk for VAD/pause detection, Whisper for accurate transcription.
+
+        Vosk streams audio and detects when the caller stops speaking (idle timeout).
+        Meanwhile, all audio is buffered for Whisper. When Vosk signals a pause,
+        the buffered audio is sent to Whisper for high-accuracy batch transcription.
+        """
+        # 1. Always buffer audio for Whisper (resample to 16kHz)
+        if not hasattr(session, 'fw_audio_buffer'):
+            session.fw_audio_buffer = b""
+        if input_rate != PCM16_TARGET_RATE:
+            whisper_audio = await asyncio.to_thread(
+                self.audio_processor.resample_audio,
+                audio_data, input_rate, PCM16_TARGET_RATE, "raw", "raw",
+            )
+        else:
+            whisper_audio = audio_data
+        session.fw_audio_buffer += whisper_audio
+
+        # 2. Feed Vosk for VAD (speech/silence detection only)
+        #    Vosk partials/finals are IGNORED for text — only used to detect pauses
+        recognizer = self._ensure_stt_recognizer(session)
+        if recognizer is not None:
+            try:
+                recognizer.AcceptWaveform(audio_data)
+            except Exception:
+                pass
+
+        # 3. Return empty — idle finalizer will trigger Whisper when Vosk detects pause
+        return []
 
     async def _process_stt_stream_faster_whisper(
         self,
@@ -2352,8 +2685,9 @@ class LocalAIServer:
 
         session.fw_audio_buffer += audio_bytes
         
-        # Only process when we have enough audio (e.g., 1 second = 32000 bytes at 16kHz mono 16-bit)
-        MIN_BUFFER_SIZE = 32000  # 1 second of audio
+        # Whisper needs sufficient audio context for accuracy (3+ seconds)
+        # Short chunks (1s) produce garbage. Let idle timeout trigger final processing.
+        MIN_BUFFER_SIZE = 96000  # 3 seconds of audio at 16kHz mono 16-bit
         if len(session.fw_audio_buffer) < MIN_BUFFER_SIZE:
             return []
 
@@ -2365,6 +2699,19 @@ class LocalAIServer:
                 # Reset backend's internal buffer since we manage our own buffer
                 await asyncio.to_thread(self.faster_whisper_backend.reset)
                 
+                # Save diagnostic audio (first call only)
+                diag_path = f"/tmp/stt_input_{session.call_id}.wav"
+                try:
+                    import wave as _wave
+                    with _wave.open(diag_path, "wb") as _wf:
+                        _wf.setnchannels(1)
+                        _wf.setsampwidth(2)
+                        _wf.setframerate(16000)
+                        _wf.writeframes(session.fw_audio_buffer)
+                    logging.info("📁 STT DIAGNOSTIC - Saved input audio: %s (%d bytes)", diag_path, len(session.fw_audio_buffer))
+                except Exception:
+                    pass
+
                 # Process buffered audio with Faster-Whisper
                 await asyncio.to_thread(
                     self.faster_whisper_backend.process_audio,
@@ -2425,8 +2772,9 @@ class LocalAIServer:
 
         session.wcpp_audio_buffer += audio_bytes
         
-        # Only process when we have enough audio (e.g., 1 second = 32000 bytes at 16kHz mono 16-bit)
-        MIN_BUFFER_SIZE = 32000  # 1 second of audio
+        # Whisper needs sufficient audio context for accuracy (3+ seconds)
+        # Short chunks (1s) produce garbage. Let idle timeout trigger final processing.
+        MIN_BUFFER_SIZE = 96000  # 3 seconds of audio at 16kHz mono 16-bit
         if len(session.wcpp_audio_buffer) < MIN_BUFFER_SIZE:
             return []
 
@@ -3038,31 +3386,66 @@ class LocalAIServer:
             try:
                 timeout_sec = max(self.buffer_timeout_ms / 1000.0, 0.1)
                 await asyncio.sleep(timeout_sec)
-                recognizer = session.recognizer
-                if recognizer is None:
-                    return
-                try:
-                    result = json.loads(recognizer.FinalResult() or "{}")
-                except json.JSONDecodeError:
-                    result = {}
-                text = (result.get("text") or "").strip()
-                confidence = result.get("confidence")
-                logging.info(
-                    "📝 STT IDLE FINALIZER - Triggering final after %s ms silence call_id=%s mode=%s preview=%s",
-                    self.buffer_timeout_ms,
-                    session.call_id,
-                    mode,
-                    text[:80],
-                )
-                await self._handle_final_transcript(
-                    websocket,
-                    session,
-                    request_id,
-                    mode=mode,
-                    text=text,
-                    confidence=confidence,
-                    idle_promoted=True,
-                )
+
+                # HYBRID MODE: if Whisper is active, use buffered audio for transcription
+                fw_buf = getattr(session, 'fw_audio_buffer', b"")
+                if self.stt_backend == "faster_whisper" and self.faster_whisper_backend and len(fw_buf) > 16000:
+                    # Whisper transcribes the full buffered audio (accurate)
+                    text = ""
+                    try:
+                        async with self._faster_whisper_lock:
+                            await asyncio.to_thread(self.faster_whisper_backend.reset)
+
+                            # Save diagnostic audio
+                            try:
+                                import wave as _wave
+                                diag_path = f"/tmp/stt_input_{session.call_id}.wav"
+                                with _wave.open(diag_path, "wb") as _wf:
+                                    _wf.setnchannels(1)
+                                    _wf.setsampwidth(2)
+                                    _wf.setframerate(16000)
+                                    _wf.writeframes(fw_buf)
+                            except Exception:
+                                pass
+
+                            await asyncio.to_thread(
+                                self.faster_whisper_backend.process_audio, fw_buf
+                            )
+                            result = await asyncio.to_thread(
+                                self.faster_whisper_backend.finalize
+                            )
+                        if result:
+                            text = (result.get("text") or "").strip()
+                    except Exception as exc:
+                        logging.warning("Whisper finalize failed: %s", exc)
+                    session.fw_audio_buffer = b""
+                    logging.info(
+                        "📝 STT IDLE FINALIZER (Whisper) - %s ms silence, %d bytes audio call_id=%s preview=%s",
+                        self.buffer_timeout_ms, len(fw_buf), session.call_id, text[:80],
+                    )
+                    await self._handle_final_transcript(
+                        websocket, session, request_id,
+                        mode=mode, text=text, confidence=None, idle_promoted=True,
+                    )
+                else:
+                    # Original Vosk path
+                    recognizer = session.recognizer
+                    if recognizer is None:
+                        return
+                    try:
+                        result = json.loads(recognizer.FinalResult() or "{}")
+                    except json.JSONDecodeError:
+                        result = {}
+                    text = (result.get("text") or "").strip()
+                    confidence = result.get("confidence")
+                    logging.info(
+                        "📝 STT IDLE FINALIZER (Vosk) - %s ms silence call_id=%s mode=%s preview=%s",
+                        self.buffer_timeout_ms, session.call_id, mode, text[:80],
+                    )
+                    await self._handle_final_transcript(
+                        websocket, session, request_id,
+                        mode=mode, text=text, confidence=confidence, idle_promoted=True,
+                    )
             except asyncio.CancelledError:
                 return
             finally:
@@ -3160,6 +3543,7 @@ class LocalAIServer:
                 return
 
             session.last_request_meta = {"mode": mode, "request_id": request_id}
+            session._vad_websocket = websocket  # for VAD early finalization callback
             stt_events = await self._process_stt_stream(session, audio_bytes, input_rate)
 
             final_emitted = False

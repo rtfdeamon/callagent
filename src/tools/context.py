@@ -196,7 +196,10 @@ class PostCallContext:
     # Tool execution data
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # In-call tool executions
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # Data from pre-call tools
-    
+
+    # Lead qualification data (collected by save_lead_info tool)
+    lead_data: Dict[str, Any] = field(default_factory=dict)
+
     # Outbound-specific
     campaign_id: Optional[str] = None
     lead_id: Optional[str] = None

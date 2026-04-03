@@ -16,9 +16,9 @@ barge_in:
   pipeline_energy_threshold: 300
   pipeline_talk_detect_enabled: true
   pipeline_talk_detect_silence_ms: 1200
-  pipeline_talk_detect_talking_threshold: 128
-  post_tts_end_protection_ms: 250
-  greeting_protection_ms: 0
+  pipeline_talk_detect_talking_threshold: 2500
+  post_tts_end_protection_ms: 500
+  greeting_protection_ms: 6000
   provider_fallback_enabled: true
   provider_fallback_providers:
     - google_live
@@ -30,14 +30,21 @@ config_version: 6
 farewell_hangup_delay_sec: 3
 contexts:
   default:
-    greeting: Hello
+    greeting: >-
+      Добрый день! Компания Мультимедиа Видеосистемы, меня зовут Анна.
+      Мы занимаемся поставкой и монтажом интерактивного оборудования
+      для образования и культуры. Подскажите, чем могу быть полезна?
     profile: telephony_ulaw_8k
     prompt: >-
-      You are Asterisk, an AI Assistant. Be helpful and concise.
+      Ты — Анна, менеджер по продажам компании MMVS «Мультимедиа Видеосистемы» (Екатеринбург).
+      Продаём интерактивные панели, проекторы, звуковое и световое оборудование
+      для музеев, библиотек, школ, ДК. Работаем по 44-ФЗ и коммерчески.
+      Стиль: деловой, тёплый, один вопрос за раз. Цену не называй — предлагай КП.
+      Говори коротко — это голосовой звонок. Только по-русски.
 
 
-      CALL ENDING:
-      - When the caller indicates they are done, say a brief farewell and use the hangup_call tool to end the call.
+      ЗАВЕРШЕНИЕ ЗВОНКА:
+      - Когда собеседник прощается, попрощайся кратко и используй инструмент hangup_call.
     provider: local
     tools:
       - hangup_call

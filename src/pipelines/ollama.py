@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
@@ -108,6 +109,42 @@ class OllamaLLMAdapter(LLMComponent):
             pass
         
         return merged
+
+    _RE_MARKDOWN = re.compile(r'\*{1,3}|#{1,6}\s?|`{1,3}|~{2,3}')
+    _RE_NUMBERED_LIST = re.compile(r'^\s*\d+\.\s+', re.MULTILINE)
+    _RE_BULLET_LIST = re.compile(r'^\s*[-•]\s+', re.MULTILINE)
+    # CJK ideographs + fullwidth forms + CJK punctuation + special tags + stray Latin words
+    _RE_NON_CYRILLIC_BLOCK = re.compile(
+        r'[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef\u2e80-\u2eff]+'
+        r'|<\|im_start\|>.*'  # strip qwen special tokens and everything after
+    , re.DOTALL)
+    # Mixed-script words: contains both Cyrillic and Latin chars (e.g., "Зdrавствуйте")
+    # Drop entire corrupted word — it's LLM garbage
+    _RE_MIXED_SCRIPT = re.compile(r'\b\S*[а-яёА-ЯЁ]\S*[A-Za-z]\S*\b|\b\S*[A-Za-z]\S*[а-яёА-ЯЁ]\S*\b')
+
+    def _sanitize_for_tts(self, text: str) -> str:
+        """Strip markdown, non-Cyrillic blocks, and special chars for clean TTS."""
+        if not text:
+            return text
+        # Remove Chinese/CJK blocks (qwen2.5 language drift)
+        text = self._RE_NON_CYRILLIC_BLOCK.sub('', text)
+        # Fix mixed script: Latin chars glued to Cyrillic (e.g., "Зdrавствуйте" → "Здравствуйте")
+        text = self._RE_MIXED_SCRIPT.sub('', text)
+        # Strip tool names leaked into response text
+        for tool_name in ('hangup_call', 'save_lead_info', 'Hangup_call'):
+            text = text.replace(tool_name, '').replace(tool_name + '.', '')
+        # Strip inline JSON objects leaked from tool-calling reasoning
+        text = re.sub(r'\{[^}]*"[a-z_]+"[^}]*\}', '', text)
+        # Remove markdown formatting
+        text = self._RE_MARKDOWN.sub('', text)
+        # Remove numbered/bullet lists → plain sentences
+        text = self._RE_NUMBERED_LIST.sub('', text)
+        text = self._RE_BULLET_LIST.sub('', text)
+        # Collapse multiple newlines into single space
+        text = re.sub(r'\n+', ' ', text)
+        # Collapse multiple spaces
+        text = re.sub(r' {2,}', ' ', text)
+        return text.strip()
 
     def _model_supports_tools(self, model: str) -> bool:
         """Check if model is known to support tool calling."""
@@ -211,10 +248,21 @@ class OllamaLLMAdapter(LLMComponent):
         # Build messages array
         # Add system message if not already present
         if not messages or messages[0].get("role") != "system":
-            system_prompt = context.get("system_prompt", "")
+            system_prompt = context.get("system_prompt") or merged.get("system_prompt", "")
             if system_prompt:
                 messages.insert(0, {"role": "system", "content": system_prompt})
-        
+
+        # RAG: inject relevant knowledge base context into system message
+        rag_context = context.get("rag_context")
+        if rag_context and messages and messages[0].get("role") == "system":
+            base = messages[0]["content"]
+            # Strip previous RAG injection if present
+            marker = "\n\n[СПРАВКА]"
+            idx = base.find(marker)
+            if idx >= 0:
+                base = base[:idx]
+            messages[0]["content"] = f"{base}{marker}\n{rag_context}"
+
         # Handle prior_messages from context (includes tool results)
         prior_messages = context.get("prior_messages", [])
         if prior_messages:
@@ -275,6 +323,14 @@ class OllamaLLMAdapter(LLMComponent):
                 payload["options"]["num_ctx"] = int(num_ctx)
             except Exception:
                 logger.debug("Invalid num_ctx for Ollama (ignoring)", call_id=call_id, num_ctx=num_ctx)
+
+        # Repeat penalty: discourage repetitive/looping output (1.0 = off, >1.0 = penalize)
+        repeat_penalty = merged.get("repeat_penalty")
+        if repeat_penalty is not None:
+            try:
+                payload["options"]["repeat_penalty"] = float(repeat_penalty)
+            except Exception:
+                pass
 
         # Add tools if model supports them.
         # Tool availability is resolved per-context by the engine (contexts are the source of truth).
@@ -354,13 +410,21 @@ class OllamaLLMAdapter(LLMComponent):
                         text = parts[-1].strip()
                     else:
                         text = text.split("<think>")[0].strip()
-                
-                # Truncate if too long for voice
-                if len(text) > 500:
-                    text = text[:500]
-                    last_period = text.rfind(".")
-                    if last_period > 200:
-                        text = text[:last_period + 1]
+
+                # Sanitize for TTS: remove markdown, non-Cyrillic, special chars
+                text = self._sanitize_for_tts(text)
+
+                # Truncate if too long for voice (telephony: keep under 250 chars)
+                # Always cut at sentence boundary to avoid mid-word breaks
+                if len(text) > 250:
+                    text = text[:250]
+                best_cut = -1
+                for sep in ('.', '!', '?'):
+                    pos = text.rfind(sep)
+                    if pos > best_cut and pos > 40:
+                        best_cut = pos
+                if best_cut > 0 and len(text) > 250:
+                    text = text[:best_cut + 1]
                 
                 logger.info(
                     "Ollama response",

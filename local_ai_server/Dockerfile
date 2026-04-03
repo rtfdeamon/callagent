@@ -15,6 +15,7 @@ ARG INCLUDE_PIPER=true
 ARG INCLUDE_KOKORO=true
 ARG INCLUDE_MELOTTS=false
 ARG INCLUDE_LLAMA=true
+ARG INCLUDE_SILERO=true
 
 WORKDIR /usr/src/app
 
@@ -86,6 +87,17 @@ RUN if [ "$INCLUDE_MELOTTS" = "true" ]; then \
 RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
         echo "📦 Installing llama-cpp-python LLM..." && \
         pip install --no-cache-dir llama-cpp-python==0.3.16; \
+    fi
+
+RUN if [ "$INCLUDE_SILERO" = "true" ]; then \
+        echo "📦 Installing Silero TTS (PyTorch CPU)..." && \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+        pip install --no-cache-dir omegaconf && \
+        echo "📦 Pre-downloading Silero TTS v4 model repo..." && \
+        apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-recommends git && \
+        git clone --depth 1 https://github.com/snakers4/silero-models.git /opt/venv/torch_cache/hub/snakers4_silero-models_master && \
+        TORCH_HOME=/opt/venv/torch_cache python -c "import torch;model,_=torch.hub.load('/opt/venv/torch_cache/hub/snakers4_silero-models_master',model='silero_tts',language='ru',speaker='v4_ru',source='local');print('Silero TTS cached OK')" && \
+        apt-get purge -y git && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
     fi
 
 # Pre-install spacy model for Kokoro TTS (only if Kokoro included)
@@ -176,6 +188,8 @@ COPY --chown=appuser:appuser . .
 # Set PATH for virtual environment
 ENV PATH="/opt/venv/bin:$PATH"
 ENV NLTK_DATA="/opt/venv/nltk_data"
+# Silero TTS model cache (pre-downloaded during build, stored in venv)
+ENV TORCH_HOME="/opt/venv/torch_cache"
 
 # Run the application
 CMD ["python", "main.py"]

@@ -70,6 +70,7 @@ services:
         - INCLUDE_KOKORO=${INCLUDE_KOKORO:-true}
         - INCLUDE_MELOTTS=${INCLUDE_MELOTTS:-false}
         - INCLUDE_LLAMA=${INCLUDE_LLAMA:-true}
+        - INCLUDE_SILERO=${INCLUDE_SILERO:-true}
         - INCLUDE_KROKO_EMBEDDED=${INCLUDE_KROKO_EMBEDDED:-false}
     container_name: local_ai_server
     network_mode: host
@@ -78,8 +79,10 @@ services:
     volumes:
       - ./models:/app/models
       - ./local_ai_server/server.py:/app/server.py
+      - ./local_ai_server/audio_processor.py:/app/audio_processor.py
     environment:
       - PYTHONUNBUFFERED=1
+      - TORCH_HOME=/opt/venv/torch_cache
       # Note: All LOCAL_* variables are loaded from .env via env_file directive above
       # Do NOT add them here with ${VAR:-default} - it prevents UI env changes from taking effect
       # The .env file should contain defaults, or use install.sh to set them

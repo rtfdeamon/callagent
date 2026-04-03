@@ -483,10 +483,19 @@ After outputting a tool call, provide a brief spoken response.
         except ImportError as e:
             logger.warning(f"Could not import RequestTranscriptTool: {e}")
         
-        # Future tools will be registered here:
-        # from src.tools.telephony.voicemail import SendToVoicemailTool
-        # self.register(SendToVoicemailTool)
-        
+        # Lead qualification tools (sales pipeline)
+        try:
+            from src.tools.business.save_lead_info import SaveLeadInfoTool
+            self.register(SaveLeadInfoTool)
+        except ImportError as e:
+            logger.warning(f"Could not import SaveLeadInfoTool: {e}")
+
+        try:
+            from src.tools.business.generate_lead_report import GenerateLeadReportTool
+            self.register(GenerateLeadReportTool)
+        except ImportError as e:
+            logger.warning(f"Could not import GenerateLeadReportTool: {e}")
+
         self._initialized = True
         logger.info(f"🛠️  Initialized {len(self._tools)} tools")
     
