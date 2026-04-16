@@ -27,6 +27,7 @@ _STT_CONFIG_MAP = {
 _TTS_CONFIG_MAP = {
     "model_path": "tts_model_path",
     "voice": None,
+    "speaker": None,
     "lang": "kokoro_lang",
     "mode": "kokoro_mode",
     "api_base_url": "kokoro_api_base_url",
@@ -67,6 +68,9 @@ def _apply_config_dict(
             elif key == "voice" and backend_name == "melotts":
                 config = replace(config, melotts_voice=str(value))
                 changed.append(f"melotts_voice={value}")
+            elif key in ("voice", "speaker") and backend_name == "silero":
+                config = replace(config, silero_speaker=str(value))
+                changed.append(f"silero_speaker={value}")
             continue
         current = getattr(config, target, None)
         if isinstance(current, bool):
@@ -162,7 +166,7 @@ def apply_switch_model_request(
 
     if "tts_backend" in data:
         backend = (data["tts_backend"] or "").strip().lower()
-        if backend in ("piper", "kokoro", "melotts"):
+        if backend in ("piper", "kokoro", "melotts", "silero"):
             new_config = replace(new_config, tts_backend=backend)
             changed.append(f"tts_backend={backend}")
 
@@ -203,5 +207,10 @@ def apply_switch_model_request(
         new_config = replace(new_config, kokoro_api_model=value)
         changed.append(f"kokoro_api_model={value}")
 
-    return new_config, changed
+    if "silero_speaker" in data:
+        value = (data["silero_speaker"] or "").strip()
+        if value:
+            new_config = replace(new_config, silero_speaker=value)
+            changed.append(f"silero_speaker={value}")
 
+    return new_config, changed

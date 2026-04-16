@@ -1037,6 +1037,11 @@ class LocalAIServer:
         # TTS configuration
         self.tts_backend = config.tts_backend
         self.tts_model_path = config.tts_model_path
+        self.silero_speaker = getattr(
+            config,
+            "silero_speaker",
+            os.getenv("SILERO_SPEAKER", "xenia"),
+        )
         self.melotts_voice = config.melotts_voice
         self.melotts_device = config.melotts_device
         self.melotts_speed = config.melotts_speed
@@ -1692,7 +1697,7 @@ class LocalAIServer:
                 self._silero_model, _ = torch.hub.load(
                     repo_or_dir='snakers4/silero-models', **load_kwargs,
                 )
-            self._silero_speaker = os.getenv("SILERO_SPEAKER", "xenia")
+            self._silero_speaker = self.silero_speaker or "xenia"
             # Generate at 48kHz for richer sound, resample to 8kHz for telephony
             self._silero_gen_rate = int(os.getenv("SILERO_SAMPLE_RATE", "48000"))
             self._silero_put_accent = os.getenv("SILERO_PUT_ACCENT", "true").lower() == "true"

@@ -5241,7 +5241,7 @@ class Engine:
                         as_fmt = (getattr(self.config, 'audiosocket', None).format or 'ulaw').lower()
                     except Exception:
                         as_fmt = 'ulaw'
-                    if as_fmt in ('slin16', 'linear16', 'pcm16'):
+                    if as_fmt in ('slin', 'linear', 'pcm', 'slin16', 'linear16', 'pcm16'):
                         rms_native = audioop.rms(audio_bytes, 2)
                         try:
                             swapped = audioop.byteswap(audio_bytes, 2)
@@ -9212,12 +9212,47 @@ class Engine:
                 async def _speak_silence_prompt(text: str) -> None:
                     """Synthesize and play a short prompt via pipeline TTS."""
                     try:
-                        tts_bytes = bytearray()
-                        async for chunk in pipeline.tts_adapter.synthesize(call_id, text, pipeline.tts_options):
-                            if chunk:
-                                tts_bytes.extend(chunk)
-                        if tts_bytes:
-                            await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
+                        use_streaming_playback = self.config.downstream_mode != "file"
+                        tts_format = (pipeline.tts_options or {}).get("format")
+                        if not isinstance(tts_format, dict):
+                            tts_format = (pipeline.tts_options or {}).get("target_format")
+                        if not isinstance(tts_format, dict):
+                            tts_format = {}
+                        tts_encoding = str(tts_format.get("encoding") or tts_format.get("format") or "mulaw")
+                        try:
+                            tts_rate = int(tts_format.get("sample_rate") or tts_format.get("sample_rate_hz") or 8000)
+                        except Exception:
+                            tts_rate = 8000
+                        if use_streaming_playback:
+                            stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+                            stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                                call_id,
+                                stream_q,
+                                playback_type="pipeline-tts",
+                                source_encoding=tts_encoding,
+                                source_sample_rate=tts_rate,
+                            )
+                            if not stream_id:
+                                raise RuntimeError("start_streaming_playback returned no stream_id")
+                            any_audio = False
+                            async for chunk in pipeline.tts_adapter.synthesize(call_id, text, pipeline.tts_options):
+                                if not chunk:
+                                    continue
+                                any_audio = True
+                                await stream_q.put(chunk)
+                            try:
+                                stream_q.put_nowait(None)
+                            except asyncio.QueueFull:
+                                asyncio.create_task(stream_q.put(None))
+                            if not any_audio:
+                                logger.warning("Silence prompt produced no audio", call_id=call_id)
+                        else:
+                            tts_bytes = bytearray()
+                            async for chunk in pipeline.tts_adapter.synthesize(call_id, text, pipeline.tts_options):
+                                if chunk:
+                                    tts_bytes.extend(chunk)
+                            if tts_bytes:
+                                await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
                     except Exception:
                         logger.debug("Silence prompt TTS failed", call_id=call_id, exc_info=True)
 

@@ -65,6 +65,7 @@ class LocalAIConfig:
 
     tts_backend: str = "piper"
     tts_model_path: str = "/app/models/tts/en_US-lessac-medium.onnx"
+    silero_speaker: str = "xenia"
 
     melotts_voice: str = "EN-US"
     melotts_device: str = "cpu"
@@ -146,6 +147,7 @@ class LocalAIConfig:
             tts_model_path=os.getenv(
                 "LOCAL_TTS_MODEL_PATH", "/app/models/tts/en_US-lessac-medium.onnx"
             ),
+            silero_speaker=os.getenv("SILERO_SPEAKER", "xenia"),
             melotts_voice=os.getenv("MELOTTS_VOICE", "EN-US"),
             melotts_device=os.getenv("MELOTTS_DEVICE", "cpu"),
             melotts_speed=float(os.getenv("MELOTTS_SPEED", "1.0")),
@@ -158,4 +160,3 @@ class LocalAIConfig:
             kokoro_api_model=(os.getenv("KOKORO_API_MODEL", "model") or "model").strip(),
             stt_idle_ms=int(os.getenv("LOCAL_STT_IDLE_MS", "5000")),
         )
-

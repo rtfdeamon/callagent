@@ -1,0 +1,18 @@
+{
+  "started_at": "2026-04-06T10:24:01.948304",
+  "recordings_found": 50,
+  "recordings_downloaded": 47,
+  "recordings_failed": 3,
+  "total_raw_duration_sec": 7980.623999999999,
+  "segments_extracted": 655,
+  "segments_too_short": 322,
+  "segments_too_noisy": 0,
+  "andreev_voice_duration_sec": 6537.7500000000055,
+  "other_voice_duration_sec": 0,
+  "segments_transcribed": 635,
+  "transcription_errors": 20,
+  "avg_segment_duration_sec": 10.11806717017518,
+  "dataset_segments": 635,
+  "dataset_duration_sec": 6424.97265306124,
+  "dataset_duration_min": 107.08287755102066
+}

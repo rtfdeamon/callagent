@@ -64,7 +64,7 @@ def _build_transcript_text(history: List[Dict[str, Any]]) -> str:
         content = msg.get("content", "")
         if not content or role not in ("user", "assistant"):
             continue
-        speaker = "Клиент" if role == "user" else "Анна"
+        speaker = "Клиент" if role == "user" else "Менеджер"
         lines.append(f"{speaker}: {content}")
     return "\n".join(lines)
 

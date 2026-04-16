@@ -174,12 +174,27 @@ class OllamaLLMAdapter(LLMComponent):
     async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
         """Initialize per-call state with conversation history."""
         merged = self._compose_options(options)
+        tool_names = list(merged.get("tools") or [])
+        tools_requested_but_unsupported = bool(
+            tool_names
+            and merged.get("tools_enabled", True)
+            and not self._model_supports_tools(str(merged.get("model") or _DEFAULT_MODEL))
+        )
         self._sessions[call_id] = {
             "messages": [],  # Ollama uses messages array like OpenAI
             "options": merged,
             "tools_attempted": False,
             "tools_failed": False,
+            "tools_requested_but_unsupported": tools_requested_but_unsupported,
         }
+        if tools_requested_but_unsupported:
+            logger.warning(
+                "Ollama model does not support tool calling; tools will be disabled",
+                call_id=call_id,
+                model=merged.get("model"),
+                tool_names=tool_names,
+                hint="Use qwen2.5:7b or another tool-capable model for in-call tools",
+            )
         logger.debug(
             "Ollama LLM session opened",
             call_id=call_id,

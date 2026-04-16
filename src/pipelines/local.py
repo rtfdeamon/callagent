@@ -535,6 +535,8 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             default_mode="stt",
         )
         self._resample_states: Dict[str, Optional[tuple]] = {}
+        self._gain_logged: Dict[str, bool] = {}
+        self._excessive_gain_warned: Dict[str, bool] = {}
 
     async def start_stream(
         self,
@@ -601,6 +603,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 input_bytes=len(audio),
             )
             return
+        pcm16 = self._apply_input_gain(pcm16, session.options, call_id=call_id)
         
         logger.debug(
             "🎤 STT audio converted and sending to server",
@@ -700,6 +703,8 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
     async def close_call(self, call_id: str) -> None:
         await self.stop_stream(call_id)
         self._resample_states.pop(call_id, None)
+        self._gain_logged.pop(call_id, None)
+        self._excessive_gain_warned.pop(call_id, None)
         await super().close_call(call_id)
 
     async def _stream_receive_loop(
@@ -770,6 +775,68 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             self._resample_states[call_id] = state
             return converted
         raise ValueError(f"Unsupported audio format '{fmt}' for local STT streaming")
+
+    def _apply_input_gain(self, pcm16: bytes, options: Dict[str, Any], call_id: str = "") -> bytes:
+        """Boost low-volume STT input when explicitly configured."""
+        if not pcm16:
+            return pcm16
+        try:
+            target_rms = int(options.get("input_gain_target_rms") or 0)
+        except Exception:
+            target_rms = 0
+        try:
+            max_gain_db = float(options.get("input_gain_max_db") or 0.0)
+        except Exception:
+            max_gain_db = 0.0
+        if target_rms <= 0 or max_gain_db <= 0.0:
+            return pcm16
+        try:
+            current_rms = audioop.rms(pcm16, 2)
+        except Exception:
+            current_rms = 0
+        if current_rms <= 3:
+            return pcm16
+        try:
+            gain_needed = target_rms / current_rms
+            max_gain = 10 ** (max_gain_db / 20.0)
+            gain = min(gain_needed, max_gain)
+            if gain <= 1.05:
+                return pcm16
+            boosted = audioop.mul(pcm16, 2, gain)
+            if gain > 10.0 and not self._excessive_gain_warned.get(call_id):
+                self._excessive_gain_warned[call_id] = True
+                logger.warning(
+                    "Local STT input requires excessive gain; caller audio is too quiet",
+                    component=self.component_key,
+                    call_id=call_id,
+                    rms_before=current_rms,
+                    rms_target=target_rms,
+                    gain=f"{gain:.2f}",
+                )
+            if not self._gain_logged.get(call_id):
+                self._gain_logged[call_id] = True
+                try:
+                    rms_after = audioop.rms(boosted, 2)
+                except Exception:
+                    rms_after = 0
+                logger.info(
+                    "Local STT input gain applied",
+                    component=self.component_key,
+                    call_id=call_id,
+                    rms_before=current_rms,
+                    rms_after=rms_after,
+                    rms_target=target_rms,
+                    gain=f"{gain:.2f}",
+                )
+            return boosted
+        except Exception:
+            logger.debug(
+                "Local STT input gain failed",
+                component=self.component_key,
+                call_id=call_id,
+                exc_info=True,
+            )
+            return pcm16
 
     async def transcribe(
         self,

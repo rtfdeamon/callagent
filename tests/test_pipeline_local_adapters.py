@@ -1,4 +1,5 @@
 import asyncio
+import audioop
 import base64
 import json
 
@@ -116,6 +117,44 @@ async def test_local_stt_adapter_transcribes(monkeypatch):
     assert audio_message["mode"] == "stt"
     decoded = base64.b64decode(audio_message["data"])
     assert decoded == audio_buffer
+
+
+@pytest.mark.asyncio
+async def test_local_stt_adapter_applies_input_gain(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalSTTAdapter(
+        "local_stt",
+        app_config,
+        provider_config,
+        {
+            "mode": "stt",
+            "input_gain_target_rms": 1200,
+            "input_gain_max_db": 30,
+        },
+    )
+
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*_args, **_kwargs):
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
+
+    await adapter.start()
+    await adapter.open_call("call-gain", {"mode": "stt", "input_gain_target_rms": 1200, "input_gain_max_db": 30})
+    await adapter.start_stream("call-gain", {"mode": "stt"})
+
+    quiet_pcm = (40).to_bytes(2, "little", signed=True) * 320
+    quiet_rms = audioop.rms(quiet_pcm, 2)
+
+    await adapter.send_audio("call-gain", quiet_pcm, fmt="pcm16_16k")
+
+    audio_message = json.loads(mock_ws.sent[-1])
+    boosted_pcm = base64.b64decode(audio_message["data"])
+    boosted_rms = audioop.rms(boosted_pcm, 2)
+
+    assert boosted_rms > quiet_rms
 
 
 @pytest.mark.asyncio

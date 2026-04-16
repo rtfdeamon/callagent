@@ -39,6 +39,11 @@ def _stt_status(server) -> Tuple[bool, Optional[str], Optional[str]]:
 
 
 def _tts_status(server) -> Tuple[bool, Optional[str], Optional[str]]:
+    if server.tts_backend == "silero":
+        loaded = server.mock_models or getattr(server, "_silero_model", None) is not None
+        path = getattr(server, "silero_speaker", None)
+        display = f"Silero ({getattr(server, 'silero_speaker', 'unknown')})"
+        return loaded, path, display
     if server.tts_backend == "piper":
         loaded = server.mock_models or server.tts_model is not None
         path = server.tts_model_path
@@ -134,6 +139,9 @@ def build_status_response(server) -> Dict[str, Any]:
             "model_path": server.kokoro_model_path,
             "api_base_url": server.kokoro_api_base_url,
             "api_key_set": bool(server.kokoro_api_key),
+        },
+        "silero": {
+            "speaker": getattr(server, "silero_speaker", None),
         },
         "gpu": gpu_status,
         "config": {
