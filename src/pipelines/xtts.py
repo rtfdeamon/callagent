@@ -150,7 +150,31 @@ class XTTSAdapter(TTSComponent):
         self._gpt_cond_latent = None  # cached speaker latent (torch.Tensor)
         self._speaker_embedding = None  # cached speaker embedding (torch.Tensor)
         self._lock = asyncio.Lock()
+        self._init_lock = asyncio.Lock()
         self._warmup_done = False
+
+    async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
+        """Прогрев модели при открытии звонка.
+
+        Orchestrator не вызывает start() сам — он строит адаптер фабрикой и
+        обращается к open_call/synthesize/close_call. Поэтому при первом
+        open_call мы лениво подгружаем модель, чтобы первый synthesize не
+        тратил 13 секунд на загрузку весов перед ответом клиенту.
+        """
+        await self._ensure_started()
+
+    async def _ensure_started(self) -> None:
+        """Идемпотентный init: грузит модель один раз, защищён от race-условий.
+
+        Вызывается из open_call() и synthesize() — обеспечивает корректную
+        работу и при «холодной» интеграции (когда start() не вызван явно).
+        """
+        if self._model is not None and self._gpt_cond_latent is not None:
+            return
+        async with self._init_lock:
+            if self._model is not None and self._gpt_cond_latent is not None:
+                return
+            await self.start()
 
     async def start(self) -> None:
         """Загрузка fine-tuned XTTS и кэширование speaker embedding."""
@@ -270,14 +294,21 @@ class XTTSAdapter(TTSComponent):
         text: str,
         options: Dict[str, Any],
     ) -> AsyncIterator[bytes]:
-        """Стриминг по предложениям: текст → wav → ресэмпл → encoding → чанки."""
+        """Стриминг по предложениям: текст → wav → ресэмпл → encoding → чанки.
+
+        Lazy-init: если модель ещё не загружена (orchestrator вызвал synthesize
+        без явного start()), грузим здесь — корректно для всех путей вызова.
+        """
         cleaned = (text or "").strip()
         if not cleaned:
             return
-        if self._model is None or self._gpt_cond_latent is None:
+        try:
+            await self._ensure_started()
+        except XTTSAdapterError as exc:
             logger.error(
-                "ОШИБКА: XTTS не инициализирован [call_id=%s] — вызовите start()",
+                "ОШИБКА: XTTS не удалось инициализировать [call_id=%s, error=%s]",
                 call_id,
+                exc,
             )
             return
 

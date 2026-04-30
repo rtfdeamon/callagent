@@ -94,7 +94,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Telemarketer API", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="/home/dmitriy/work/callagent/ai_telemarketer"), name="static")
+# Каталог статики берём от расположения файла, а не хардкодим:
+# в Docker (/app) и других checkout-ах путь будет другой, иначе StaticFiles
+# падает на старте до того, как FastAPI успеет принять запросы.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+app.mount("/static", StaticFiles(directory=_APP_DIR), name="static")
 
 
 # ─── Pydantic Models ───
