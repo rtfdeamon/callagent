@@ -4,10 +4,15 @@ import os
 import sys
 import wave
 import asyncio
+import itertools
 import websockets
 import json
 import numpy as np
 from pathlib import Path
+
+# Счётчик реплик для уникальных имён temp-файлов в пределах одного процесса
+# (PID + index). Process-local — для разных EAGI-процессов PID уже разный.
+_playback_counter = itertools.count()
 
 # Добавляем корневой путь проекта для импорта
 sys.path.append(str(Path(__file__).parent.parent))
@@ -82,16 +87,30 @@ async def handle_responses(ws):
                 audio_8k_np = resample_audio(audio_np, src_rate, 8000)
                 audio_8k_pcm = float_to_pcm16(audio_8k_np)
 
-                # В EAGI пишем 8кГц PCM в WAV-файл и проигрываем через STREAM FILE.
-                tmp_wav = "/tmp/asterisk_ai_response.wav"
+                # Уникальное имя файла на звонок: PID процесса EAGI + порядковый
+                # номер реплики. Asterisk запускает отдельный процесс на каждый
+                # звонок, так что PID гарантированно разный между параллельными
+                # звонками; единый /tmp/asterisk_ai_response.wav между ними
+                # перетирался бы и приводил к утечке аудио в чужой канал.
+                playback_index = next(_playback_counter)
+                stem = f"/tmp/asterisk_ai_response_{os.getpid()}_{playback_index}"
+                tmp_wav = f"{stem}.wav"
                 with wave.open(tmp_wav, 'wb') as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)
                     wf.setframerate(8000)
                     wf.writeframes(audio_8k_pcm)
-                
-                # Команда Asterisk для проигрывания (без расширения .wav)
-                await agi_command(f"STREAM FILE /tmp/asterisk_ai_response \"\"")
+
+                try:
+                    # Команда Asterisk для проигрывания (без расширения .wav)
+                    await agi_command(f"STREAM FILE {stem} \"\"")
+                finally:
+                    # Удаляем файл после проигрывания, чтобы не накапливать
+                    # мусор в /tmp при долгих звонках.
+                    try:
+                        os.unlink(tmp_wav)
+                    except OSError:
+                        pass
                 
     except Exception as e:
         sys.stderr.write(f"[EAGI] Response handle error: {e}\n")
