@@ -159,6 +159,13 @@ class XTTSAdapter(TTSComponent):
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._warmup_done = False
+        # Ref-counting активных звонков. Адаптер shared между call'ами через
+        # фабрику orchestrator — release_pipeline() зовёт close_call+stop()
+        # на каждом завершении, но реально выгружать модель надо только
+        # когда последний звонок отпустил адаптер. Иначе параллельный
+        # звонок остаётся без модели посередине synthesize.
+        self._active_calls: int = 0
+        self._refcount_lock = asyncio.Lock()
 
     @staticmethod
     def _discover_vocab_path(model_dir: str) -> Optional[str]:
@@ -192,14 +199,57 @@ class XTTSAdapter(TTSComponent):
         return None
 
     async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
-        """Прогрев модели при открытии звонка.
+        """Прогрев модели при открытии звонка + инкремент счётчика звонков.
 
         Orchestrator не вызывает start() сам — он строит адаптер фабрикой и
         обращается к open_call/synthesize/close_call. Поэтому при первом
         open_call мы лениво подгружаем модель, чтобы первый synthesize не
         тратил 13 секунд на загрузку весов перед ответом клиенту.
         """
+        async with self._refcount_lock:
+            self._active_calls += 1
         await self._ensure_started()
+
+    async def close_call(self, call_id: str) -> None:
+        """Декремент счётчика звонков. Модель не выгружаем — она shared
+        между всеми звонками этого адаптера; реальный stop() произойдёт
+        либо явным вызовом из orchestrator shutdown, либо когда счётчик
+        дойдёт до нуля и кто-то вызовет stop()."""
+        async with self._refcount_lock:
+            if self._active_calls > 0:
+                self._active_calls -= 1
+
+    async def stop(self) -> None:  # type: ignore[override]
+        """Освобождение модели только если нет активных звонков.
+
+        Orchestrator вызывает stop() в release_pipeline на каждом завершении
+        звонка, но shared XTTSAdapter не может выгрузить модель, пока
+        параллельный звонок ещё synthesize'ит. Если счётчик > 0, stop —
+        no-op; модель освободится при последнем close_call → stop()
+        либо при shutdown процесса (CUDA освободит память).
+        """
+        async with self._refcount_lock:
+            if self._active_calls > 0:
+                logger.debug(
+                    "XTTS stop отложен: %d активных звонков", self._active_calls
+                )
+                return
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """Реальная выгрузка модели и embedding из VRAM."""
+        if self._model is not None:
+            try:
+                _, _, torch, _, _ = _lazy_imports()
+                self._model = None
+                self._gpt_cond_latent = None
+                self._speaker_embedding = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                self._model = None
+                self._gpt_cond_latent = None
+                self._speaker_embedding = None
 
     async def _ensure_started(self) -> None:
         """Идемпотентный init: грузит модель один раз, защищён от race-условий.
@@ -283,21 +333,6 @@ class XTTSAdapter(TTSComponent):
             logger.warning(
                 "ПРЕДУПРЕЖДЕНИЕ: прогрев XTTS не удался [error=%s]", exc, exc_info=True
             )
-
-    async def stop(self) -> None:
-        """Отдаём память GPU."""
-        if self._model is not None:
-            try:
-                _, _, torch, _, _ = _lazy_imports()
-                self._model = None
-                self._gpt_cond_latent = None
-                self._speaker_embedding = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                self._model = None
-                self._gpt_cond_latent = None
-                self._speaker_embedding = None
 
     def _inference_sync(self, text: str, language: str):
         """Синхронный inference через низкоуровневое API. Возвращает np.ndarray
