@@ -236,20 +236,26 @@ class XTTSAdapter(TTSComponent):
                 self._active_calls -= 1
 
     async def stop(self) -> None:  # type: ignore[override]
-        """Освобождение модели только если нет активных звонков.
+        """No-op для shared XTTSAdapter.
 
         Orchestrator вызывает stop() в release_pipeline на каждом завершении
-        звонка, но shared XTTSAdapter не может выгрузить модель, пока
-        параллельный звонок ещё synthesize'ит. Если счётчик > 0, stop —
-        no-op; модель освободится при последнем close_call → stop()
-        либо при shutdown процесса (CUDA освободит память).
+        звонка. Если бы мы здесь выгружали модель (даже когда _active_calls=0),
+        каждый последовательный звонок платил бы 13-секундный cold-start —
+        фабрика возвращает один и тот же кэшированный adapter. Поэтому
+        реальная выгрузка делается только в shutdown() при остановке процесса
+        либо вообще не делается (CUDA освободит VRAM при exit процесса).
+
+        Параллельные звонки также защищены: модель остаётся в VRAM, любой
+        synthesize находит инициализированную модель.
         """
-        async with self._refcount_lock:
-            if self._active_calls > 0:
-                logger.debug(
-                    "XTTS stop отложен: %d активных звонков", self._active_calls
-                )
-                return
+        return
+
+    async def shutdown(self) -> None:
+        """Явная выгрузка модели — для graceful shutdown процесса.
+
+        Использовать только при остановке всего сервиса (orchestrator
+        cleanup), но не в release_pipeline между звонками.
+        """
         await self._teardown()
 
     async def _teardown(self) -> None:

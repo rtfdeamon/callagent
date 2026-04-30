@@ -6,3 +6,6 @@ aiohttp
 pydantic
 scipy
 python-multipart
+# Используется и FastAPI WebSocket'ом (через uvicorn[standard]), и EAGI
+# telephony agent'ом (telephony/telephony_agent.py: import websockets).
+websockets
