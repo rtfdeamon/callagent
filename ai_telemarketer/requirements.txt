@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+faster-whisper
+TTS
+aiohttp
+pydantic
+scipy
+python-multipart

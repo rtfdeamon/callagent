@@ -110,6 +110,57 @@ class AudioCaptureManager:
                 exc_info=True,
             )
 
+    def append_raw(
+        self,
+        call_id: str,
+        stream_name: str,
+        payload: bytes,
+        *,
+        extension: str,
+    ) -> None:
+        """Append raw bytes к диагностическому файлу `<stream_name>.<ext>`.
+
+        Используется для сохранения исходного потока (μ-law / SLIN16 / opus)
+        как есть, без декодирования — нужно для диагностики качества звука
+        и проверки трещаний (см. project_direct_audiosocket).
+
+        Активируется только при keep_files=True. В продакшене (keep_files=False)
+        вызов игнорируется, чтобы не оставлять следов на диске.
+        """
+        if not payload:
+            return
+        if not self.keep_files:
+            return
+        safe_ext = (extension or "bin").lower().lstrip(".") or "bin"
+        path = os.path.join(self.base_dir, call_id, f"{stream_name}.{safe_ext}")
+        dir_path = os.path.dirname(path)
+        with self._lock:
+            try:
+                os.makedirs(dir_path, mode=0o700, exist_ok=True)
+                try:
+                    os.chmod(dir_path, 0o700)
+                except Exception:
+                    pass
+                with open(path, "ab") as f:
+                    f.write(payload)
+                try:
+                    os.chmod(path, 0o600)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    import structlog
+                    logger = structlog.get_logger(__name__)
+                    logger.warning(
+                        "Raw audio capture failed",
+                        call_id=call_id,
+                        stream_name=stream_name,
+                        extension=safe_ext,
+                        payload_len=len(payload),
+                    )
+                except Exception:
+                    pass
+
     def close_call(self, call_id: str) -> None:
         keys_to_close = []
         with self._lock:

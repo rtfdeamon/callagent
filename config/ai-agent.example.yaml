@@ -180,6 +180,25 @@ providers:
     style: 0.0
     use_speaker_boost: true
 
+  # XTTS TTS — локальный синтез голоса на Coqui XTTS v2 (с поддержкой
+  # fine-tuned чекпойнтов, например, голос Андреева для MMVS).
+  # По умолчанию выключен: модель тяжёлая (~5 ГБ VRAM), требует явных
+  # путей к весам и reference WAV. Включается через enabled=true.
+  # Подробное описание адаптера: src/pipelines/xtts.py.
+  xtts_tts:
+    enabled: false
+    capabilities:
+      - tts
+    # Каталог с fine-tuned моделью (должен содержать config.json и best_model.pth):
+    model_dir: "${XTTS_MODEL_DIR:-/home/dmitriy/work/callagent/data/xtts_finetuned_andreev_v2/andreev_clean_v4-April-21-2026_04+55PM-12778e79}"
+    # Reference WAV-файл голоса (6–30 с эталонной речи):
+    speaker_wav: "${XTTS_SPEAKER_WAV:-/home/dmitriy/work/callagent/data/andreev_dataset_clean/wavs/andreev_0000.wav}"
+    device: "cuda"          # "cuda" или "cpu" (CPU в 10–20 раз медленнее)
+    language: "ru"
+    target_sample_rate: 8000  # 8000 для SIP/телефонии, 16000/24000 для web
+    encoding: "mulaw"         # "mulaw" / "pcm16" / "wav"
+    chunk_size_ms: 40         # размер выходного чанка в мс
+
 # Canonical LLM defaults (used by providers/pipelines unless overridden)
 llm:
   initial_greeting: "Hello, how can I help you today?"

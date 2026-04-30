@@ -526,6 +526,87 @@ class Engine:
                 exc_info=exc,
             )
 
+    @staticmethod
+    def _pipeline_transcript_stats(text: str) -> Tuple[int, int]:
+        """Возвращает (число_слов, число_символов_без_пробелов)."""
+        cleaned = (text or "").strip()
+        words = len([w for w in cleaned.split() if w])
+        chars = len(cleaned.replace(" ", ""))
+        return (words, chars)
+
+    @staticmethod
+    def _pipeline_transcript_ready(text: str, *, force: bool) -> bool:
+        """Решает, готов ли накопленный транскрипт к отдаче в LLM.
+
+        force=True — принимаем любой непустой текст (сработал flush по таймауту);
+        force=False — требуем минимум 2 слова или 10 символов (без пробелов).
+        Это нижняя граница «короткой осмысленной реплики» в русском диалоге;
+        ниже — обычно междометия, которые лучше дождаться продолжения.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        if force:
+            return True
+        words, chars = Engine._pipeline_transcript_stats(cleaned)
+        return words >= 2 or chars >= 10
+
+    @staticmethod
+    def _default_pipeline_aggregation_timeout_sec(provider: str) -> float:
+        """Дефолтный таймаут агрегации сегментов STT по типу провайдера.
+
+        local_stt (Vosk) выдаёт стабильные partial'ы — можно держать низкий
+        таймаут (0.6 с) и быстро отдавать в LLM. Облачные провайдеры
+        (Deepgram и пр.) имеют сетевую джиттер-задержку — закладываем 1.2 с.
+        """
+        p = (provider or "").lower()
+        if p == "local_stt":
+            return 0.6
+        if p == "deepgram_stt":
+            return 1.2
+        return 2.0
+
+    @staticmethod
+    def _should_emit_pipeline_no_input_reprompt(
+        session: Any,
+        *,
+        reprompts_sent: int,
+        max_reprompts: int,
+        rms_threshold: int = 32,
+        fresh_window_sec: float = 5.0,
+    ) -> bool:
+        """Проверяет, нужно ли выдать reprompt («Алло, вы меня слышите?»).
+
+        Условия одновременно:
+        - не воспроизводится TTS (иначе перебьём собственную речь);
+        - захват аудио включён и медиа-вход подтверждён (иначе тишина —
+          артефакт транспорта, а не молчание абонента);
+        - rms на входе ниже порога (тишина) и значение свежее;
+        - лимит reprompt'ов ещё не исчерпан.
+        """
+        if reprompts_sent >= max_reprompts:
+            return False
+        if getattr(session, "tts_playing", False):
+            return False
+        if not getattr(session, "audio_capture_enabled", False):
+            return False
+        if not getattr(session, "media_rx_confirmed", False):
+            return False
+        diag = getattr(session, "audio_diagnostics", None) or {}
+        transport_in = (diag.get("transport_in") if isinstance(diag, dict) else None) or {}
+        rms = transport_in.get("rms")
+        updated = transport_in.get("updated")
+        if rms is None or updated is None:
+            return False
+        try:
+            if (time.time() - float(updated)) > fresh_window_sec:
+                return False
+            if int(rms) >= int(rms_threshold):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def _fire_and_forget(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
         """Create a fire-and-forget task with exception logging."""
         task = asyncio.create_task(coro, name=name)

@@ -40,6 +40,14 @@ logger = logging.getLogger(__name__)
 
 
 async def test_tts_roundtrip() -> bool:
+    """tts_request → tts_response (JSON с base64 audio_data).
+
+    Контракт: на запрос type=tts_request сервер отвечает одним JSON
+    сообщением type=tts_response, где аудио закодировано base64 в
+    поле audio_data. Бинарных фреймов в этом режиме не отправляется
+    (см. local_ai_server/server.py:3628 и docs/local-ai-server/PROTOCOL.md
+    раздел "tts_request").
+    """
     async with websockets.connect(WS_URL, max_size=None) as ws:
         req = {
             "type": "tts_request",
@@ -48,43 +56,66 @@ async def test_tts_roundtrip() -> bool:
             "request_id": "t1",
         }
         await ws.send(json.dumps(req))
-        meta = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
-        assert meta["type"] == "tts_audio"
-        assert meta["encoding"] == "mulaw"
-        # Next message should be binary μ-law bytes
-        pcm = await asyncio.wait_for(ws.recv(), timeout=10.0)
-        assert isinstance(pcm, (bytes, bytearray))
-        logger.info("Received TTS audio bytes: %s", len(pcm))
-        return len(pcm) > 0
+        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
+        assert resp["type"] == "tts_response", f"Unexpected type: {resp.get('type')}"
+        assert resp["encoding"] == "mulaw"
+        assert resp.get("request_id") == "t1"
+        assert isinstance(resp.get("audio_data"), str)
+        audio_bytes = base64.b64decode(resp["audio_data"])
+        logger.info("Received TTS audio bytes (b64-decoded): %s", len(audio_bytes))
+        return len(audio_bytes) > 0
 
 
 async def test_stt_binary_flow() -> bool:
+    """STT-режим: проверка формата stt_result.
+
+    Отправляем тишину. Сервер не обязан выдавать is_final=True (нет речи —
+    нет окончательного транскрипта), но обязан отдать хотя бы один JSON
+    stt_result с корректной формой контракта (поля type/call_id/text).
+    """
     async with websockets.connect(WS_URL, max_size=None) as ws:
         await ws.send(json.dumps({"type": "set_mode", "mode": "stt", "call_id": "demo"}))
-        # mode_ready is optional; server may not echo. Continue regardless.
+        # Ожидаем mode_ready, но без assertion — старые версии могут не отвечать
         try:
-            _ = await asyncio.wait_for(ws.recv(), timeout=2.0)
-        except Exception:
+            ack = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            if isinstance(ack, str):
+                evt = json.loads(ack)
+                if evt.get("type") == "mode_ready":
+                    assert evt.get("mode") == "stt"
+        except asyncio.TimeoutError:
             pass
-        # Send 1s of silence PCM16@16k
+
         pcm_silence = b"\x00\x00" * 16000
         await ws.send(pcm_silence)
-        # Expect one or more stt_result payloads; final may be empty depending on silence
+
+        # Ждём первый stt_result (partial или final). На тишине Vosk обычно
+        # выдаёт is_partial=True с пустым текстом — этого достаточно для
+        # проверки протокольного контракта.
         for _ in range(3):
-            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            except asyncio.TimeoutError:
+                return False
             if isinstance(msg, (bytes, bytearray)):
-                # ignore any unexpected binary frames
                 continue
             evt = json.loads(msg)
-            if evt.get("type") == "stt_result" and evt.get("is_final"):
-                logger.info("Final STT text: '%s'", evt.get("text", ""))
+            if evt.get("type") == "stt_result":
+                assert evt.get("call_id") == "demo"
+                assert "text" in evt
+                assert "is_final" in evt or "is_partial" in evt
+                logger.info("STT result OK: %s", evt)
                 return True
         return False
 
 
 async def test_full_audio_frame() -> bool:
+    """Full-режим: один JSON аудиокадр должен породить stt_result.
+
+    На тишине LLM и TTS не вызываются (нет распознанного текста), поэтому
+    проверяем только что сервер принял кадр и ответил stt_result. Полный
+    цикл STT→LLM→TTS требует реальной речи и тестируется в e2e-сценариях.
+    """
     async with websockets.connect(WS_URL, max_size=None) as ws:
-        # Send JSON audio frame (silence) in full mode
         pcm = b"\x00\x00" * 16000
         req = {
             "type": "audio",
@@ -95,25 +126,21 @@ async def test_full_audio_frame() -> bool:
             "data": base64.b64encode(pcm).decode("utf-8"),
         }
         await ws.send(json.dumps(req))
-        # Expect stt_result partials/final then llm_response then tts_audio + binary
-        saw_final = False
-        saw_llm = False
-        saw_tts_meta = False
-        for _ in range(10):
-            msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
+
+        for _ in range(5):
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return False
             if isinstance(msg, (bytes, bytearray)):
-                if saw_tts_meta:
-                    logger.info("Received TTS audio bytes: %s", len(msg))
-                    return True
-                continue
+                logger.info("Received early binary frame: %s bytes", len(msg))
+                return True
             evt = json.loads(msg)
-            if evt.get("type") == "stt_result" and evt.get("is_final"):
-                saw_final = True
-            elif evt.get("type") == "llm_response":
-                saw_llm = True
-            elif evt.get("type") == "tts_audio":
-                saw_tts_meta = True
-        return saw_final and saw_llm and saw_tts_meta
+            if evt.get("type") == "stt_result":
+                assert evt.get("call_id") == "full-test"
+                logger.info("Full-mode stt_result OK: %s", evt)
+                return True
+        return False
 
 
 async def main() -> None:

@@ -37,6 +37,7 @@ from .ollama import OllamaLLMAdapter
 from .openai import OpenAISTTAdapter, OpenAILLMAdapter, OpenAITTSAdapter
 from .groq import GroqSTTAdapter, GroqTTSAdapter
 from .telnyx import TelnyxLLMAdapter
+from .xtts import XTTSAdapter
 
 logger = get_logger(__name__)
 
@@ -611,6 +612,32 @@ class PipelineOrchestrator:
             note="Self-hosted LLM with optional tool calling",
         )
 
+        # XTTS (Coqui) — локальный fine-tuned синтез голоса.
+        # Включается через providers.xtts_tts.enabled=true в YAML.
+        # По умолчанию выключен: модель тяжёлая (~5 ГБ VRAM), требует
+        # явного указания путей к чекпойнту и reference WAV.
+        xtts_provider_config: Dict[str, Any] = {}
+        if isinstance(providers, dict) and "xtts_tts" in providers:
+            xtts_cfg = providers.get("xtts_tts", {})
+            if isinstance(xtts_cfg, dict) and xtts_cfg.get("enabled") is True:
+                xtts_provider_config = dict(xtts_cfg)
+
+        if xtts_provider_config:
+            xtts_factory = self._make_xtts_tts_factory(xtts_provider_config)
+            self.register_factory("xtts_tts", xtts_factory)
+            logger.info(
+                "XTTS TTS adapter registered",
+                tts_factory="xtts_tts",
+                model_dir=xtts_provider_config.get("model_dir"),
+                speaker_wav=xtts_provider_config.get("speaker_wav"),
+                device=xtts_provider_config.get("device", "cuda"),
+            )
+        else:
+            logger.debug(
+                "XTTS TTS adapter not registered "
+                "(set providers.xtts_tts.enabled=true в YAML, чтобы включить)"
+            )
+
         self._register_openai_compatible_llm_factories()
 
 
@@ -652,7 +679,7 @@ class PipelineOrchestrator:
         """Create factory for Ollama LLM adapter (self-hosted local models)."""
         # Merge provider config with pipeline options at runtime
         base_config = dict(provider_config)
-        
+
         def factory(component_key: str, options: Dict[str, Any]) -> Component:
             # Provider config from YAML takes precedence, runtime options can override
             merged = dict(base_config)
@@ -661,6 +688,25 @@ class PipelineOrchestrator:
                 self.config,
                 merged,
             )
+        return factory
+
+    def _make_xtts_tts_factory(self, provider_config: Dict[str, Any]) -> ComponentFactory:
+        """Фабрика XTTS TTS-адаптера (Coqui XTTS v2 + fine-tuned веса).
+
+        Конфиг провайдера (из YAML) сливается с per-pipeline опциями. Поля,
+        которые ожидает XTTSAdapter: model_dir, model_path, config_path,
+        speaker_wav, device, language, target_sample_rate, encoding,
+        chunk_size_ms.
+        """
+        base_config = dict(provider_config)
+        # Поле "enabled" в options адаптеру не нужно — отбрасываем.
+        base_config.pop("enabled", None)
+
+        def factory(component_key: str, options: Dict[str, Any]) -> Component:
+            merged = dict(base_config)
+            merged.update(options or {})
+            return XTTSAdapter(options=merged)
+
         return factory
 
     def _make_local_stt_factory(
