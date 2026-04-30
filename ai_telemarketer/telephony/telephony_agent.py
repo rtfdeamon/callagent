@@ -133,12 +133,30 @@ async def main():
     try:
         async with websockets.connect(uri) as ws:
             sys.stderr.write("[EAGI] Connected to AI Backend\n")
-            
-            # Запускаем два параллельных процесса: чтение и воспроизведение
-            await asyncio.gather(
-                read_asterisk_audio(ws),
-                handle_responses(ws)
+
+            # Два параллельных процесса: чтение из Asterisk и воспроизведение
+            # ответов. При hangup Asterisk закрывает FD 3 → read_asterisk_audio
+            # завершается, но handle_responses продолжает ждать на ws.recv()
+            # бесконечно. Запускаем через wait(FIRST_COMPLETED) и закрываем
+            # WS + cancel'им оставшуюся таску, иначе EAGI-процесс зависает
+            # после разъединения.
+            reader_task = asyncio.create_task(read_asterisk_audio(ws))
+            responder_task = asyncio.create_task(handle_responses(ws))
+            done, pending = await asyncio.wait(
+                {reader_task, responder_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            sys.stderr.write(
+                f"[EAGI] One side completed (done={[t.get_name() for t in done]}), "
+                f"закрываем WS и отменяем оставшиеся таски\n"
+            )
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
     except Exception as e:
         sys.stderr.write(f"[EAGI] Connection failed: {e}\n")
         await agi_command("SAY PHONETIC Error")

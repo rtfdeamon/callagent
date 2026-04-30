@@ -199,8 +199,13 @@ providers:
     # vocab_path: "${XTTS_VOCAB_PATH}"
     device: "cuda"          # "cuda" или "cpu" (CPU в 10–20 раз медленнее)
     language: "ru"
-    target_sample_rate: 8000  # 8000 для SIP/телефонии, 16000/24000 для web
-    encoding: "mulaw"         # "mulaw" / "pcm16" / "wav"
+    # Формат вывода. Engine читает именно nested `format` для streaming
+    # playback, поэтому он — основной источник истины. Адаптер также
+    # принимает плоские target_sample_rate/encoding для обратной
+    # совместимости (фабрика свернёт их в format автоматически).
+    format:
+      encoding: "mulaw"      # "mulaw" / "pcm16" (slin16/linear16) / "wav"
+      sample_rate: 8000      # 8000 для SIP/телефонии, 16000/24000 для web
     chunk_size_ms: 40         # размер выходного чанка в мс
 
 # Canonical LLM defaults (used by providers/pipelines unless overridden)

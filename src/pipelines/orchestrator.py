@@ -710,15 +710,31 @@ class PipelineOrchestrator:
         def factory(component_key: str, options: Dict[str, Any]) -> Component:
             merged = dict(base_config)
             merged.update(options or {})
+
+            # Engine читает pipeline.tts_options["format"] (nested dict с
+            # encoding/sample_rate) для streaming playback. Если YAML задал
+            # только flat target_sample_rate/encoding — собираем nested
+            # format здесь, иначе engine декодирует как μ-law 8 кГц по
+            # умолчанию и портит pcm16 / 16 кГц вывод.
+            existing_format = merged.get("format")
+            if not isinstance(existing_format, dict):
+                existing_format = merged.get("target_format")
+            if not isinstance(existing_format, dict):
+                merged["format"] = {
+                    "encoding": str(merged.get("encoding", "mulaw")).lower(),
+                    "sample_rate": int(merged.get("target_sample_rate", 8000)),
+                }
+
             # Ключ кэша — параметры, которые влияют на загруженную модель
             # и поток вывода. speaker_wav входит, потому что embedding
             # кэшируется в адаптере и пересчёт его — это новая модель.
+            fmt = merged.get("format") or {}
             cache_key = (
                 merged.get("model_path") or merged.get("model_dir"),
                 merged.get("speaker_wav"),
                 merged.get("device", "cuda"),
-                merged.get("encoding", "mulaw"),
-                merged.get("target_sample_rate", 8000),
+                str(fmt.get("encoding", "mulaw")).lower(),
+                int(fmt.get("sample_rate", 8000)),
             )
             adapter = cache.get(cache_key)
             if adapter is None:

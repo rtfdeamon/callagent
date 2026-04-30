@@ -138,8 +138,24 @@ class XTTSAdapter(TTSComponent):
         )
         self._device: str = opts.get("device", "cuda")
         self._language: str = opts.get("language", "ru")
-        self._target_sample_rate: int = int(opts.get("target_sample_rate", 8000))
-        self._encoding: str = str(opts.get("encoding", "mulaw")).lower()
+        # Формат вывода: основной источник истины — nested `format` dict
+        # (engine.py читает pipeline.tts_options["format"] для streaming
+        # playback). Если задан только nested format — он приоритетен.
+        # Плоские target_sample_rate/encoding оставлены для совместимости
+        # и удобства YAML; они склеиваются в format при необходимости.
+        fmt = opts.get("format") if isinstance(opts.get("format"), dict) else None
+        if fmt is None:
+            fmt = opts.get("target_format") if isinstance(opts.get("target_format"), dict) else None
+        if fmt is None:
+            fmt = {}
+        self._target_sample_rate: int = int(
+            fmt.get("sample_rate") or fmt.get("sample_rate_hz")
+            or opts.get("target_sample_rate", 8000)
+        )
+        self._encoding: str = str(
+            fmt.get("encoding") or fmt.get("format")
+            or opts.get("encoding", "mulaw")
+        ).lower()
         self._chunk_size_ms: int = int(opts.get("chunk_size_ms", 40))
         # Параметры инференса (совместимы с ai_telemarketer/tts/xtts_service.py).
         self._temperature: float = float(opts.get("temperature", 0.75))
@@ -385,8 +401,22 @@ class XTTSAdapter(TTSComponent):
             )
             return
 
-        target_sr = int(options.get("target_sample_rate", self._target_sample_rate))
-        encoding = str(options.get("encoding", self._encoding)).lower()
+        # Same precedence как в __init__: nested format > flat keys > defaults.
+        # Это гарантирует, что engine (читающий pipeline.tts_options["format"])
+        # и адаптер сходятся в одном представлении формата вывода.
+        fmt = options.get("format") if isinstance(options.get("format"), dict) else None
+        if fmt is None:
+            fmt = options.get("target_format") if isinstance(options.get("target_format"), dict) else None
+        if fmt is None:
+            fmt = {}
+        target_sr = int(
+            fmt.get("sample_rate") or fmt.get("sample_rate_hz")
+            or options.get("target_sample_rate", self._target_sample_rate)
+        )
+        encoding = str(
+            fmt.get("encoding") or fmt.get("format")
+            or options.get("encoding", self._encoding)
+        ).lower()
         chunk_ms = int(options.get("chunk_size_ms", self._chunk_size_ms))
         speaker_wav = options.get("speaker_wav") or self._speaker_wav
         language = options.get("language") or self._language
