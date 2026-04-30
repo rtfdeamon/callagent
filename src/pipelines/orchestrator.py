@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from ..config import (
@@ -693,19 +693,38 @@ class PipelineOrchestrator:
     def _make_xtts_tts_factory(self, provider_config: Dict[str, Any]) -> ComponentFactory:
         """Фабрика XTTS TTS-адаптера (Coqui XTTS v2 + fine-tuned веса).
 
-        Конфиг провайдера (из YAML) сливается с per-pipeline опциями. Поля,
-        которые ожидает XTTSAdapter: model_dir, model_path, config_path,
-        speaker_wav, device, language, target_sample_rate, encoding,
-        chunk_size_ms.
+        Возвращает SHARED instance: модель XTTS весит ~5 ГБ VRAM и
+        прогревается ~13 с, поэтому создавать по экземпляру на звонок —
+        недопустимо (OOM при двух параллельных звонках, cold-start на каждый).
+        Адаптер потокобезопасен через внутренний asyncio.Lock в synthesize().
+
+        Кэш ключуется по (model_path, speaker_wav, device, encoding,
+        target_sample_rate) — если опции пайплайна реально меняют модель,
+        будет создан второй экземпляр; для типового случая (одна модель,
+        одни параметры на проект) кэш отдаёт ту же ссылку.
         """
         base_config = dict(provider_config)
-        # Поле "enabled" в options адаптеру не нужно — отбрасываем.
         base_config.pop("enabled", None)
+        cache: Dict[Tuple[Any, ...], XTTSAdapter] = {}
 
         def factory(component_key: str, options: Dict[str, Any]) -> Component:
             merged = dict(base_config)
             merged.update(options or {})
-            return XTTSAdapter(options=merged)
+            # Ключ кэша — параметры, которые влияют на загруженную модель
+            # и поток вывода. speaker_wav входит, потому что embedding
+            # кэшируется в адаптере и пересчёт его — это новая модель.
+            cache_key = (
+                merged.get("model_path") or merged.get("model_dir"),
+                merged.get("speaker_wav"),
+                merged.get("device", "cuda"),
+                merged.get("encoding", "mulaw"),
+                merged.get("target_sample_rate", 8000),
+            )
+            adapter = cache.get(cache_key)
+            if adapter is None:
+                adapter = XTTSAdapter(options=merged)
+                cache[cache_key] = adapter
+            return adapter
 
         return factory
 

@@ -189,10 +189,14 @@ providers:
     enabled: false
     capabilities:
       - tts
-    # Каталог с fine-tuned моделью (должен содержать config.json и best_model.pth):
-    model_dir: "${XTTS_MODEL_DIR:-/home/dmitriy/work/callagent/data/xtts_finetuned_andreev_v2/andreev_clean_v4-April-21-2026_04+55PM-12778e79}"
+    # Каталог с fine-tuned моделью (config.json + best_model.pth):
+    model_dir: "${XTTS_MODEL_DIR}"
     # Reference WAV-файл голоса (6–30 с эталонной речи):
-    speaker_wav: "${XTTS_SPEAKER_WAV:-/home/dmitriy/work/callagent/data/andreev_dataset_clean/wavs/andreev_0000.wav}"
+    speaker_wav: "${XTTS_SPEAKER_WAV}"
+    # vocab.json: если рядом с моделью, опустите параметр — найдётся
+    # автоматически (<model_dir>/vocab.json или ../vocab.json).
+    # Иначе укажите явно или задайте XTTS_BASE_DIR в окружении.
+    # vocab_path: "${XTTS_VOCAB_PATH}"
     device: "cuda"          # "cuda" или "cpu" (CPU в 10–20 раз медленнее)
     language: "ru"
     target_sample_rate: 8000  # 8000 для SIP/телефонии, 16000/24000 для web

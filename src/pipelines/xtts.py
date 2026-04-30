@@ -120,11 +120,18 @@ class XTTSAdapter(TTSComponent):
         self._config_path: str = opts.get("config_path") or (
             os.path.join(self._model_dir, "config.json") if self._model_dir else ""
         )
-        # vocab.json у fine-tuned чекпойнтов часто отсутствует — fallback на
-        # vocab из базовой XTTS v2 (XTTS_VOCAB_PATH или модели в models/xtts_v2/).
-        self._vocab_path: str = opts.get("vocab_path") or os.getenv(
-            "XTTS_VOCAB_PATH",
-            "/home/dmitriy/work/callagent/models/xtts_v2/vocab.json",
+        # vocab.json: ищем по приоритету
+        # 1) явный vocab_path в опциях; 2) ENV XTTS_VOCAB_PATH;
+        # 3) <model_dir>/vocab.json (рядом с весами — обычное место);
+        # 4) <model_dir>/../<base>/vocab.json — для fine-tuned чекпойнтов,
+        #    у которых vocab лежит вместе с базовой XTTS v2 (XTTS_BASE_DIR).
+        # Хардкоды путей пользовательской машины убраны — рабочее значение
+        # либо приходит из конфига/ENV, либо находится рядом с моделью.
+        self._vocab_path: str = (
+            opts.get("vocab_path")
+            or os.getenv("XTTS_VOCAB_PATH")
+            or self._discover_vocab_path(self._model_dir)
+            or ""
         )
         self._speaker_wav: str = opts.get("speaker_wav") or os.getenv(
             "XTTS_SPEAKER_WAV", ""
@@ -152,6 +159,37 @@ class XTTSAdapter(TTSComponent):
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
         self._warmup_done = False
+
+    @staticmethod
+    def _discover_vocab_path(model_dir: str) -> Optional[str]:
+        """Находит vocab.json без хардкода пользовательских путей.
+
+        Порядок:
+        1) <model_dir>/vocab.json — обычное место для базовых моделей.
+        2) <model_dir>/../vocab.json — fine-tuned чекпойнт может лежать в
+           подкаталоге вроде `andreev_clean_v4-.../`, vocab — на уровень выше.
+        3) ENV XTTS_BASE_DIR/vocab.json — каталог базовой XTTS v2.
+
+        Возвращает первый существующий путь или None — тогда start()
+        упадёт с понятным сообщением.
+        """
+        if not model_dir:
+            base_env = os.getenv("XTTS_BASE_DIR")
+            if base_env:
+                cand = os.path.join(base_env, "vocab.json")
+                return cand if os.path.isfile(cand) else None
+            return None
+        candidates = [
+            os.path.join(model_dir, "vocab.json"),
+            os.path.join(os.path.dirname(model_dir.rstrip("/")), "vocab.json"),
+        ]
+        base_env = os.getenv("XTTS_BASE_DIR")
+        if base_env:
+            candidates.append(os.path.join(base_env, "vocab.json"))
+        for cand in candidates:
+            if os.path.isfile(cand):
+                return cand
+        return None
 
     async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
         """Прогрев модели при открытии звонка.
