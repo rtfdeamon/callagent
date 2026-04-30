@@ -101,10 +101,11 @@ class DialogManager:
             raise OllamaUnavailableError(f"Healthcheck Ollama не удался: {exc}") from exc
 
         installed = {m.get("name", "") for m in data.get("models", []) if isinstance(m, dict)}
-        # Ollama хранит имена в формате "qwen2.5:1.5b" (с тегом). Сверяем точно.
-        if self.model not in installed and not any(
-            name.split(":", 1)[0] == self.model.split(":", 1)[0] for name in installed
-        ):
+        # Сверяем ИМЕННО полное имя (включая тег), потому что /api/generate
+        # вызывается с self.model дословно. Совпадение по базе (qwen2.5:7b
+        # вместо qwen2.5:1.5b) пропускает healthcheck, но runtime запрос
+        # упадёт с 404 model not found — недопустимо.
+        if self.model not in installed:
             raise OllamaUnavailableError(
                 f"Модель {self.model} не загружена в Ollama. "
                 f"Запустите: ollama pull {self.model}. "

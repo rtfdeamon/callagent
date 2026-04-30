@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import io
 import os
 import sys
+import wave
 import asyncio
 import websockets
 import json
@@ -51,18 +53,37 @@ async def handle_responses(ws):
                 data = json.loads(message)
                 sys.stderr.write(f"[EAGI] AI Status: {data.get('type')} - {data.get('text', '')}\n")
             else:
-                # Бинарные данные (аудио ответ от XTTS, 24 кГц)
-                audio_np = pcm16_to_float(message)
-                
-                # Ресамплинг: 24кГц -> 8кГц (для телефонии)
-                audio_8k_np = resample_audio(audio_np, 24000, 8000)
+                # Бинарные данные — это WAV-файл от XTTS (с RIFF-заголовком).
+                # Декодируем WAV перед ресэмплированием, иначе RIFF-заголовок
+                # будет интерпретирован как аудио-семплы → шум в начале и
+                # неверная длительность.
+                try:
+                    with wave.open(io.BytesIO(message), 'rb') as wf_in:
+                        src_rate = wf_in.getframerate()
+                        n_channels = wf_in.getnchannels()
+                        sampwidth = wf_in.getsampwidth()
+                        pcm_in = wf_in.readframes(wf_in.getnframes())
+                except wave.Error as exc:
+                    sys.stderr.write(
+                        f"[EAGI] WAV decode error: {exc} "
+                        f"(размер сообщения {len(message)} байт)\n"
+                    )
+                    continue
+
+                if sampwidth != 2 or n_channels != 1:
+                    sys.stderr.write(
+                        f"[EAGI] Неподдерживаемый WAV: "
+                        f"sampwidth={sampwidth}, channels={n_channels}\n"
+                    )
+                    continue
+
+                audio_np = pcm16_to_float(pcm_in)
+                # Ресамплинг: src_rate (обычно 24кГц XTTS) → 8кГц для телефонии
+                audio_8k_np = resample_audio(audio_np, src_rate, 8000)
                 audio_8k_pcm = float_to_pcm16(audio_8k_np)
-                
-                # В EAGI мы можем просто писать PCM прямо в STDOUT, если канал открыт в режиме RAW,
-                # но надежнее использовать временный файл и STREAM FILE.
-                # Для скорости создаем временный WAV
+
+                # В EAGI пишем 8кГц PCM в WAV-файл и проигрываем через STREAM FILE.
                 tmp_wav = "/tmp/asterisk_ai_response.wav"
-                import wave
                 with wave.open(tmp_wav, 'wb') as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)
