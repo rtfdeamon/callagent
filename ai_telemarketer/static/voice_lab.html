@@ -275,31 +275,69 @@
             transcript.prepend(msg);
         }
 
+        // Целевая частота для backend'а (Whisper в /ws ждёт PCM16 16 кГц).
+        const TARGET_SR = 16000;
+
+        // Линейный ресэмплер Float32 → Float32 для случаев, когда браузер
+        // игнорирует sampleRate в AudioContext (Firefox, некоторые Safari).
+        // Для STT-потока качество достаточное; полифазный фильтр не нужен.
+        function resampleLinear(input, srcRate, dstRate) {
+            if (srcRate === dstRate) return input;
+            const ratio = srcRate / dstRate;
+            const dstLen = Math.round(input.length / ratio);
+            const out = new Float32Array(dstLen);
+            for (let i = 0; i < dstLen; i++) {
+                const srcIdx = i * ratio;
+                const i0 = Math.floor(srcIdx);
+                const i1 = Math.min(i0 + 1, input.length - 1);
+                const frac = srcIdx - i0;
+                out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+            }
+            return out;
+        }
+
         async function initAudio() {
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            // Просим у браузера AudioContext с 16 кГц — Chrome/Edge/Safari
+            // ресэмплят источник автоматически. Firefox может вернуть
+            // фактическую частоту железа (44.1/48 кГц); тогда ресэмплим
+            // в onaudioprocess вручную.
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+            const actualSR = audioContext.sampleRate;
+            if (actualSR !== TARGET_SR) {
+                console.warn(`AudioContext не соблюдает 16 кГц: actual=${actualSR}. Включён клиентский ресэмплер.`);
+            }
+
             mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             const source = audioContext.createMediaStreamSource(mediaStream);
-            
+
             // ScriptProcessor для простоты (PCM 16bit Int16)
             processor = audioContext.createScriptProcessor(4096, 1, 1);
-            
+
             source.connect(processor);
             processor.connect(audioContext.destination);
 
             processor.onaudioprocess = (e) => {
                 if (!isActive || !socket || socket.readyState !== WebSocket.OPEN) return;
-                
-                const inputData = e.inputBuffer.getChannelData(0);
-                // Конвертируем Float32 -> Int16
-                const int16Data = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    int16Data[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+
+                let floatData = e.inputBuffer.getChannelData(0);
+                // Гарантируем 16 кГц на выходе вне зависимости от того,
+                // что вернул браузер.
+                if (actualSR !== TARGET_SR) {
+                    floatData = resampleLinear(floatData, actualSR, TARGET_SR);
                 }
-                
+
+                // Конвертируем Float32 → Int16
+                const int16Data = new Int16Array(floatData.length);
+                for (let i = 0; i < floatData.length; i++) {
+                    int16Data[i] = Math.max(-1, Math.min(1, floatData[i])) * 0x7FFF;
+                }
+
                 socket.send(int16Data.buffer);
-                
-                // Визуализация
-                const level = Math.sqrt(inputData.reduce((s, x) => s + x*x, 0) / inputData.length);
+
+                // Визуализация (по исходному float, до ресэмпла — точнее
+                // отражает уровень микрофона)
+                const orig = e.inputBuffer.getChannelData(0);
+                const level = Math.sqrt(orig.reduce((s, x) => s + x*x, 0) / orig.length);
                 bars.forEach((b, idx) => {
                     const h = 10 + (level * 200 * Math.sin(Date.now()/200 + idx/5));
                     b.style.height = `${Math.min(100, h)}px`;
