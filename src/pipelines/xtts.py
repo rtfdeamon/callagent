@@ -76,12 +76,19 @@ logger = logging.getLogger(__name__)
 # Импорты тяжёлых зависимостей делаем ленивыми — без них основной пайплайн
 # должен импортироваться без ошибок (в проде XTTS может быть не нужен).
 def _lazy_imports():
-    """Импорт TTS, torch, numpy, soundfile только при первом обращении."""
+    """Импорт torch/TTS низкоуровневых модулей только при первом обращении.
+
+    Используем низкоуровневое API Coqui (XttsConfig + Xtts.load_checkpoint)
+    вместо высокоуровневого TTS.api.TTS, потому что fine-tuned чекпойнты
+    требуют явного `checkpoint_path=` в load_checkpoint, а высокоуровневый
+    API ожидает каталог с дефолтной структурой.
+    """
     import numpy as np
     import soundfile as sf
     import torch
-    from TTS.api import TTS
-    return np, sf, torch, TTS
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import Xtts
+    return np, sf, torch, XttsConfig, Xtts
 
 
 class XTTSAdapterError(RuntimeError):
@@ -107,12 +114,18 @@ class XTTSAdapter(TTSComponent):
         self._model_dir: str = opts.get("model_dir") or os.getenv(
             "XTTS_MODEL_DIR", ""
         )
-        self._model_path: str = opts.get("model_path") or os.path.join(
-            self._model_dir, "best_model.pth"
-        ) if self._model_dir else ""
-        self._config_path: str = opts.get("config_path") or os.path.join(
-            self._model_dir, "config.json"
-        ) if self._model_dir else ""
+        self._model_path: str = opts.get("model_path") or (
+            os.path.join(self._model_dir, "best_model.pth") if self._model_dir else ""
+        )
+        self._config_path: str = opts.get("config_path") or (
+            os.path.join(self._model_dir, "config.json") if self._model_dir else ""
+        )
+        # vocab.json у fine-tuned чекпойнтов часто отсутствует — fallback на
+        # vocab из базовой XTTS v2 (XTTS_VOCAB_PATH или модели в models/xtts_v2/).
+        self._vocab_path: str = opts.get("vocab_path") or os.getenv(
+            "XTTS_VOCAB_PATH",
+            "/home/dmitriy/work/callagent/models/xtts_v2/vocab.json",
+        )
         self._speaker_wav: str = opts.get("speaker_wav") or os.getenv(
             "XTTS_SPEAKER_WAV", ""
         )
@@ -121,15 +134,26 @@ class XTTSAdapter(TTSComponent):
         self._target_sample_rate: int = int(opts.get("target_sample_rate", 8000))
         self._encoding: str = str(opts.get("encoding", "mulaw")).lower()
         self._chunk_size_ms: int = int(opts.get("chunk_size_ms", 40))
+        # Параметры инференса (совместимы с ai_telemarketer/tts/xtts_service.py).
+        self._temperature: float = float(opts.get("temperature", 0.75))
+        self._repetition_penalty: float = float(opts.get("repetition_penalty", 5.0))
+        self._top_k: int = int(opts.get("top_k", 50))
+        self._top_p: float = float(opts.get("top_p", 0.85))
+        self._do_sample: bool = bool(opts.get("do_sample", False))
+        self._length_penalty: float = float(opts.get("length_penalty", 1.1))
+        self._num_beams: int = int(opts.get("num_beams", 1))
+        self._speed: float = float(opts.get("speed", 1.0))
         # Coqui XTTS v2 выдаёт 24 кГц
         self._native_sample_rate: int = 24000
 
-        self._tts = None  # type: Any
+        self._model = None  # Xtts instance
+        self._gpt_cond_latent = None  # cached speaker latent (torch.Tensor)
+        self._speaker_embedding = None  # cached speaker embedding (torch.Tensor)
         self._lock = asyncio.Lock()
         self._warmup_done = False
 
     async def start(self) -> None:
-        """Загрузка модели XTTS и однократный прогрев."""
+        """Загрузка fine-tuned XTTS и кэширование speaker embedding."""
         if not self._model_dir or not os.path.isdir(self._model_dir):
             raise XTTSAdapterError(
                 f"XTTS: каталог модели не задан или не существует: {self._model_dir!r}"
@@ -142,37 +166,55 @@ class XTTSAdapter(TTSComponent):
             raise XTTSAdapterError(
                 f"XTTS: config.json не найден: {self._config_path!r}"
             )
+        if not os.path.isfile(self._vocab_path):
+            raise XTTSAdapterError(
+                f"XTTS: vocab.json не найден: {self._vocab_path!r} "
+                f"(укажите vocab_path в config или XTTS_VOCAB_PATH)"
+            )
         if not os.path.isfile(self._speaker_wav):
             raise XTTSAdapterError(
                 f"XTTS: reference WAV не найден: {self._speaker_wav!r}"
             )
 
         logger.info(
-            "ИНФО: загрузка XTTS [model_dir=%s, device=%s]",
+            "ИНФО: загрузка XTTS [model_dir=%s, checkpoint=%s, device=%s]",
             self._model_dir,
+            os.path.basename(self._model_path),
             self._device,
         )
 
         def _load_sync():
-            np, sf, torch, TTS = _lazy_imports()
-            tts = TTS(
-                model_path=self._model_path,
-                config_path=self._config_path,
-                progress_bar=False,
-                gpu=(self._device == "cuda" and torch.cuda.is_available()),
+            np, sf, torch, XttsConfig, Xtts = _lazy_imports()
+            config = XttsConfig()
+            config.load_json(self._config_path)
+            model = Xtts.init_from_config(config)
+            model.load_checkpoint(
+                config,
+                checkpoint_path=self._model_path,
+                vocab_path=self._vocab_path,
+                eval=True,
+                use_deepspeed=False,
             )
-            return tts
+            use_cuda = self._device == "cuda" and torch.cuda.is_available()
+            model = model.to("cuda" if use_cuda else "cpu")
+            return model
 
-        self._tts = await asyncio.to_thread(_load_sync)
+        self._model = await asyncio.to_thread(_load_sync)
 
-        # Прогрев: первый синтез долгий (компиляция CUDA-ядер). Делаем тихо.
+        # Кэшируем speaker latent + embedding (вычисляются один раз).
+        def _compute_speaker_sync():
+            return self._model.get_conditioning_latents(
+                audio_path=[self._speaker_wav]
+            )
+
+        gpt_cond_latent, speaker_embedding = await asyncio.to_thread(_compute_speaker_sync)
+        self._gpt_cond_latent = gpt_cond_latent
+        self._speaker_embedding = speaker_embedding
+        logger.info("ИНФО: XTTS speaker embedding закэширован")
+
+        # Прогрев: первый inference долгий (компиляция CUDA-ядер).
         try:
-            await asyncio.to_thread(
-                self._tts.tts,
-                text="Привет.",
-                speaker_wav=self._speaker_wav,
-                language=self._language,
-            )
+            await asyncio.to_thread(self._inference_sync, "Привет.", self._language)
             self._warmup_done = True
             logger.info("ИНФО: XTTS прогрет, готов к синтезу")
         except Exception as exc:
@@ -181,15 +223,46 @@ class XTTSAdapter(TTSComponent):
             )
 
     async def stop(self) -> None:
-        """Отдаём память GPU. Coqui TTS не имеет явного close, поэтому удаляем."""
-        if self._tts is not None:
+        """Отдаём память GPU."""
+        if self._model is not None:
             try:
-                _, _, torch, _ = _lazy_imports()
-                self._tts = None
+                _, _, torch, _, _ = _lazy_imports()
+                self._model = None
+                self._gpt_cond_latent = None
+                self._speaker_embedding = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
-                self._tts = None
+                self._model = None
+                self._gpt_cond_latent = None
+                self._speaker_embedding = None
+
+    def _inference_sync(self, text: str, language: str):
+        """Синхронный inference через низкоуровневое API. Возвращает np.ndarray
+        float32 с частотой 24 кГц (нативная для XTTS)."""
+        np, _, torch, _, _ = _lazy_imports()
+        kwargs = {
+            "text": f"{text} ",  # padding-пробел: модель не обрывает окончания
+            "language": language,
+            "gpt_cond_latent": self._gpt_cond_latent,
+            "speaker_embedding": self._speaker_embedding,
+            "repetition_penalty": self._repetition_penalty,
+            "length_penalty": self._length_penalty,
+            "do_sample": self._do_sample,
+            "num_beams": self._num_beams,
+            "speed": self._speed,
+            "enable_text_splitting": False,
+        }
+        if self._do_sample:
+            kwargs.update(
+                {"temperature": self._temperature, "top_k": self._top_k, "top_p": self._top_p}
+            )
+        with torch.no_grad():
+            out = self._model.inference(**kwargs)
+        wav = out["wav"]
+        if isinstance(wav, torch.Tensor):
+            wav = wav.cpu().float().numpy()
+        return np.asarray(wav, dtype=np.float32)
 
     async def synthesize(
         self,
@@ -201,9 +274,10 @@ class XTTSAdapter(TTSComponent):
         cleaned = (text or "").strip()
         if not cleaned:
             return
-        if self._tts is None:
+        if self._model is None or self._gpt_cond_latent is None:
             logger.error(
-                "ОШИБКА: XTTS не инициализирован [call_id=%s]", call_id
+                "ОШИБКА: XTTS не инициализирован [call_id=%s] — вызовите start()",
+                call_id,
             )
             return
 
@@ -280,36 +354,36 @@ class XTTSAdapter(TTSComponent):
     ) -> bytes:
         """Синхронный синтез одного предложения. Возвращает байты в `encoding`.
 
-        target_sr — частота для декодера AudioSocket (8000 для SIP).
+        speaker_wav — необязательный override; если совпадает с self._speaker_wav,
+        используется закэшированный speaker_embedding. Иначе пересчитывается
+        (медленно, ~1 с) — нужно только при смене голоса в рантайме.
         """
-        np, sf, torch, _ = _lazy_imports()
-        wav = self._tts.tts(
-            text=sentence,
-            speaker_wav=speaker_wav,
-            language=language,
-        )
-        # Coqui отдаёт list/np.ndarray float32 в диапазоне ±1.0
-        arr = np.asarray(wav, dtype=np.float32)
+        np, sf, _, _, _ = _lazy_imports()
+
+        if speaker_wav and speaker_wav != self._speaker_wav:
+            # Голос сменился — пересчитываем conditioning. Редкий случай.
+            self._gpt_cond_latent, self._speaker_embedding = (
+                self._model.get_conditioning_latents(audio_path=[speaker_wav])
+            )
+            self._speaker_wav = speaker_wav
+
+        arr = self._inference_sync(sentence, language)
         if arr.ndim > 1:
             arr = arr.mean(axis=-1)  # моно
-        # ресэмпл нужно делать качественно: используем soxr через soundfile,
-        # либо простой decimation. Здесь — через soundfile in-memory:
-        # пишем 24k WAV → читаем с целевой частотой через scipy.signal.resample_poly.
         if self._native_sample_rate != target_sr:
             arr = self._resample_linear(arr, self._native_sample_rate, target_sr)
 
         # PCM16
         pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-        if encoding == "pcm16" or encoding == "slin16" or encoding == "linear16":
+        if encoding in ("pcm16", "slin16", "linear16"):
             return pcm16
-        if encoding == "mulaw" or encoding == "ulaw" or encoding == "g711_ulaw":
+        if encoding in ("mulaw", "ulaw", "g711_ulaw"):
             return audioop.lin2ulaw(pcm16, 2)
         if encoding == "wav":
             buf = io.BytesIO()
             sf.write(buf, arr, target_sr, format="WAV", subtype="PCM_16")
             return buf.getvalue()
-        # Fallback: PCM16
         logger.warning(
             "ПРЕДУПРЕЖДЕНИЕ: неизвестный encoding %r → выдаю PCM16", encoding
         )
