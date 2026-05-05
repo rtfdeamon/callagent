@@ -5,6 +5,7 @@ import json
 import sys
 import time
 
+import pytest
 import websockets
 
 
@@ -17,6 +18,7 @@ TEST_PHRASES = [
 ]
 
 
+@pytest.mark.skip(reason="Needs local TTS server running")
 async def test_tts():
     """Send TTS requests and measure latency."""
     print("=" * 60)
